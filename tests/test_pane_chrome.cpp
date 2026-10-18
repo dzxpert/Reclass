@@ -198,61 +198,6 @@ private slots:
         }
     }
 
-    void testPaneTabStyleIsAnUnderline() {
-        const Theme t = makeTheme();
-        const QString qss = paneTabStyle(t, QStringLiteral("JetBrains Mono"));
-        QVERIFY(qss.contains(QStringLiteral("border-bottom: 2px solid ")
-                             + t.indHoverSpan.name()));
-        QVERIFY(qss.contains(QStringLiteral("margin-left: 8px")));   // kGutter
-        QVERIFY(qss.contains(QStringLiteral("padding: 0px 8px")));
-        QVERIFY(qss.contains(editorPaperColor(t).name()));           // paper, not chrome
-    }
-
-    void testPaneTabStyleHasNoBoxAndNoFill() {
-        const Theme t = makeTheme();
-        const QString qss = paneTabStyle(t, QStringLiteral("JetBrains Mono"));
-        // The two literals this replaced drew side borders, a selected-tab
-        // fill and a negative padding to make room for a TOP accent.
-        QVERIFY(!qss.contains(QStringLiteral("border-left")));
-        QVERIFY(!qss.contains(QStringLiteral("border-right")));
-        QVERIFY(!qss.contains(QStringLiteral("border-top")));
-        QVERIFY(!qss.contains(QStringLiteral("padding-top: -")));
-        QVERIFY(!qss.contains(t.backgroundAlt.name()));
-    }
-
-    void testEveryPaneTabReservesTheUnderline() {
-        const Theme t = makeTheme();
-        const QString qss = paneTabStyle(t, QStringLiteral("JetBrains Mono"));
-        // A border-bottom only on :selected ADDS to that tab's box, so the
-        // selected tab stood 2 px taller than its siblings (and than the
-        // corner strip, which is pinned to the same 26 px). Every tab has to
-        // reserve the same underline row and only change its colour.
-        QVERIFY(qss.contains(QStringLiteral("border-bottom: 2px solid transparent")));
-    }
-
-    void testFirstPaneTabSpendsTheGutterExactlyOnce() {
-        const Theme t = makeTheme();
-        const QString qss = paneTabStyle(t, QStringLiteral("JetBrains Mono"));
-        // margin-left 8 (kGutter) ON TOP OF the shared padding put the first
-        // label 16 px in — twice the gutter every other strip uses.
-        QVERIFY(qss.contains(QStringLiteral(
-            "QTabBar::tab:first { margin-left: 8px; padding-left: 0px; }")));
-    }
-
-    void testWholePaneTabStripIsOneSurface() {
-        const Theme t = makeTheme();
-        const QString qss = paneTabStyle(t, QStringLiteral("JetBrains Mono"));
-        const QString paper = editorPaperColor(t).name();
-        // Tabs on paper with the bar (and the zoom/format corner) left on
-        // theme.background drew a faint box around the tab group — the exact
-        // "fill at rest" cue the underline grammar removes from the tabs.
-        for (const QString& sel : { QStringLiteral("QTabBar { border: none; background: %1; }"),
-                                    QStringLiteral("QTabWidget { background: %1; }"),
-                                    QStringLiteral("QWidget#rcxPaneCorner { background: %1; }") })
-            QVERIFY2(qss.contains(sel.arg(paper)), qPrintable(sel));
-    }
-
-    // ── Status segment ──────────────────────────────────────────────────
     void testSelectionStatusNamesFieldAndOffset() {
         NodeTree tree;
         const Built b = buildClass(tree, "UnnamedClass0");

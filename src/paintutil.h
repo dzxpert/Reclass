@@ -16,6 +16,9 @@ namespace rcx {
 // many logical px from the strip's left edge so the left margin reads as ONE
 // line down the window instead of five slightly different ones.
 inline constexpr int kGutter = 8;
+// The top strip in each editor view: fixed chrome, independent of content zoom.
+inline constexpr int kEditorBarHeight = 26;
+inline constexpr int kEditorBarControlHeight = 22;
 
 // One tab grammar: "current" is always this many DEVICE rows of the accent on
 // the strip's bottom edge — ribbon tabs, checked ribbon items, document tabs

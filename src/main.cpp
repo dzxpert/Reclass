@@ -1,4 +1,8 @@
 #include "mainwindow.h"
+#include "widgets/type_graph_view.h"
+#include "widgets/pane_controls.h"
+#include "widgets/pane_view_strip.h"
+#include "widgets/pane_layout.h"
 #include <cstdio>
 #include "tab_source_icon.h"
 #include "profiler.h"
@@ -99,7 +103,6 @@
 #include "demo_simulation.h"
 #include "widgets/font_choices.h"
 #include "widgets/selection_status.h"
-#include "widgets/zoom_slider.h"
 #include "widgets/dock_header.h"
 #include "widgets/address_bar.h"
 #include "widgets/panel_search_field.h"
@@ -1437,8 +1440,9 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
         auto* tab = activeTab();
         if (!tab) return;
         for (int i = 0; i < tab->panes.size(); ++i) {
-            if (tab->panes[i].tabWidget && tab->panes[i].tabWidget->isAncestorOf(now)) {
+            if (tab->panes[i].paneBox && (tab->panes[i].paneBox == now || tab->panes[i].paneBox->isAncestorOf(now))) {
                 tab->activePaneIdx = i;
+                updatePaneAffordances(*tab);
                 return;
             }
         }
@@ -2198,10 +2202,27 @@ void MainWindow::createMenus() {
                     QKeySequence(Qt::CTRL | Qt::Key_Backslash),
                     makeIcon(":/vsicons/split-vertical.svg"), this,
                     &MainWindow::splitView);
-    Qt5Qt6AddAction(view, "&Unsplit View",
+    Qt5Qt6AddAction(view, "&Close Pane",
                     QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_Backslash),
                     QIcon(), this, &MainWindow::unsplitView);
     view->addSeparator();
+    auto* nextView = view->addAction("Next editor view");
+    nextView->setShortcut(QKeySequence(Qt::Key_F6));
+    connect(nextView, &QAction::triggered, this, [this] {
+        auto* tab = activeTab(); if (!tab || tab->panes.isEmpty()) return;
+        restoreViews();
+        auto& p = tab->panes[(tab->activePaneIdx + 1) % tab->panes.size()];
+        activatePane(p.tabWidget);
+        if (p.viewMode == VM_Reclass) p.editor->scintilla()->setFocus();
+        else if (p.viewMode == VM_Rendered) p.rendered->setFocus();
+        else if (p.viewMode == VM_Debug) p.debugView->setFocus();
+        else p.graphView->setFocus();
+    });
+    auto* maximizeView = view->addAction("Maximize / restore editor view");
+    maximizeView->setShortcut(QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_M));
+    connect(maximizeView, &QAction::triggered, this, [this] {
+        if (auto* p = findActiveSplitPane()) if (p->viewStrip->maximize) p->viewStrip->maximize();
+    });
     view->addAction(m_workspaceDock->toggleViewAction());
     {
         // Toggling never touches the dock's AREA or floating state — the
@@ -3269,19 +3290,40 @@ void MainWindow::endProgress() {
 void MainWindow::setAppStatus(const QString& text) {
     m_appStatus = text;
     m_appStatusDim.clear();
-    if (!m_mcpBusy) {
-        m_statusLabel->setText(text);
-        m_statusLabel->setShimmerActive(false);
-    }
+    refreshStatusDisplay();
 }
 
 void MainWindow::setAppStatus(const QString& text, const QString& dimSuffix) {
     m_appStatus = text;
     m_appStatusDim = dimSuffix;
-    if (!m_mcpBusy) {
-        m_statusLabel->setText(text, dimSuffix);
+    refreshStatusDisplay();
+}
+
+void MainWindow::refreshStatusDisplay() {
+    if (!m_statusNotification.isEmpty()) {
+        m_statusLabel->setText(m_statusNotification);
+        m_statusLabel->setShimmerActive(false);
+    } else if (m_mcpBusy) {
+        m_statusLabel->setText(m_mcpStatus);
+        m_statusLabel->setShimmerActive(true);
+    } else {
+        m_statusLabel->setText(m_appStatus, m_appStatusDim);
         m_statusLabel->setShimmerActive(false);
     }
+}
+
+void MainWindow::showStatusNotification(const QString& text, int durationMs) {
+    if (!m_statusNotificationTimer) {
+        m_statusNotificationTimer = new QTimer(this);
+        m_statusNotificationTimer->setSingleShot(true);
+        connect(m_statusNotificationTimer, &QTimer::timeout, this, [this]() {
+            m_statusNotification.clear();
+            refreshStatusDisplay();
+        });
+    }
+    m_statusNotification = text;
+    m_statusNotificationTimer->start(durationMs);
+    refreshStatusDisplay();
 }
 
 // Rebuild the status bar's location segment from a controller's CURRENT
@@ -3337,8 +3379,8 @@ void MainWindow::setMcpStatus(const QString& text) {
     // Cancel any pending clear — new activity extends the shimmer
     if (m_mcpClearTimer) m_mcpClearTimer->stop();
     m_mcpBusy = true;
-    m_statusLabel->setText(text);
-    m_statusLabel->setShimmerActive(true);
+    m_mcpStatus = text;
+    refreshStatusDisplay();
 }
 
 void MainWindow::clearMcpStatus() {
@@ -3348,8 +3390,7 @@ void MainWindow::clearMcpStatus() {
         m_mcpClearTimer->setSingleShot(true);
         connect(m_mcpClearTimer, &QTimer::timeout, this, [this]() {
             m_mcpBusy = false;
-            m_statusLabel->setText(m_appStatus, m_appStatusDim);
-            m_statusLabel->setShimmerActive(false);
+            refreshStatusDisplay();
         });
     }
     m_mcpClearTimer->start(750);
@@ -3429,20 +3470,17 @@ protected:
 MainWindow::SplitPane MainWindow::createSplitPane(TabState& tab) {
     SplitPane pane;
 
-    pane.tabWidget = new QTabWidget;
+    pane.tabWidget = new PaneTabs;
+    pane.tabWidget->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Ignored);
     pane.tabWidget->setTabPosition(QTabWidget::South);
-    pane.tabWidget->tabBar()->setVisible(true);
+    pane.viewStrip = new PaneViewStrip(pane.tabWidget);
+    pane.tabWidget->setCornerWidget(pane.viewStrip, Qt::BottomRightCorner);
     pane.tabWidget->setDocumentMode(true);  // kill QTabWidget frame border
-    // Hide the unstyled `<` `>` scroll buttons that Qt adds when tabs
-    // overflow. Overflowing tabs just clip — user can widen the pane to
-    // see the rest. Matches the user's preference: no graphical
-    // clutter, no Qt-default chrome poking through the theme.
-    pane.tabWidget->setUsesScrollButtons(false);
+    pane.tabWidget->setUsesScrollButtons(true);
     pane.tabWidget->setElideMode(Qt::ElideNone);
+    pane.tabWidget->tabBar()->setExpanding(false);
+    pane.tabWidget->tabBar()->setAccessibleName("Editor views");
 
-    // Flat tabs on the editor paper — one sheet, shared with applyTheme
-    // (rcx::paneTabStyle). The box borders are gone: the selected tab is
-    // marked only by the underline every tab family in the app uses.
     {
         const auto& t = ThemeManager::instance().current();
         QSettings s("RC", "RC");
@@ -3506,39 +3544,16 @@ MainWindow::SplitPane MainWindow::createSplitPane(TabState& tab) {
     // read-only Scintilla pinned on the right. Off by default — enabled via
     // View menu Minimap toggle. Text sync is driven by the editor's
     // documentApplied signal (see RcxEditor::applyDocument).
-    // Custom container that paints its own 1-DEVICE-pixel border.
-    // Going through QSS `border: 1px solid X` rendered as a 2-pixel
-    // sunken bevel because Qt treats QSS px as logical, then the
-    // display's DPR (1.5 on this monitor) multiplied that to 2 device
-    // pixels — visible as a "double line". Painting at 1 / DPR uses
-    // QRectF subpixel coordinates so the result is exactly one device
-    // pixel thick regardless of DPI scaling.
-    class EditorContainer : public QWidget {
-    public:
-        explicit EditorContainer() : QWidget() {}
-    protected:
-        void paintEvent(QPaintEvent*) override {
-            // ONLY the bottom edge: the seam between the document and the view
-            // tabs under it. The outline around the whole pane belongs to
-            // rcx::PaneBox now (widgets/pane_tabs.h) — this class used to draw
-            // all four edges, which is why Structure and Code were boxed while
-            // Debug was not and Both drew two boxes. Drawing them here again
-            // would land on the pane box's own device rows and double.
-            const QColor seam = property("borderColor").value<QColor>();
-            if (!seam.isValid()) return;
-            QPainter p(this);
-            rcx::fillBottomDeviceRowOfRect(p, QRectF(rect()), seam);
-        }
-    };
+    // PaneBox and PaneTabs own the outline and tab seam. Content meets them directly.
     {
-        auto* ec = new EditorContainer;
+        auto* ec = new QWidget;
         ec->setObjectName(QStringLiteral("rcxEditorContainer"));
         ec->setProperty("borderColor",
                         containerBorderColor(ThemeManager::instance().current()));
         pane.editorContainer = ec;
     }
     auto* ecLayout = new QHBoxLayout(pane.editorContainer);
-    ecLayout->setContentsMargins(1, 1, 1, 1);
+    ecLayout->setContentsMargins(0, 0, 0, 0);
     ecLayout->setSpacing(0);
     ecLayout->addWidget(pane.editor, /*stretch=*/1);
 
@@ -3618,7 +3633,7 @@ MainWindow::SplitPane MainWindow::createSplitPane(TabState& tab) {
         edSci->ensureLineVisible(line);
     });
 
-    // Host the editor in a thin container page so "Both" can REPARENT the
+    // Host the editor in a persistent page owned by this pane.
     // editorContainer into a side-by-side splitter and back without disturbing
     // the tab itself (the page stays; only its child moves).
     pane.reclassPage = new QWidget;
@@ -3632,34 +3647,30 @@ MainWindow::SplitPane MainWindow::createSplitPane(TabState& tab) {
     // outline as the hex editor (EditorContainer) so the Code view reads as a
     // peer pane, especially side-by-side in "Both".
     {
-        auto* rc = new EditorContainer;
+        auto* rc = new QWidget;
         rc->setObjectName(QStringLiteral("rcxCodeContainer"));
         rc->setProperty("borderColor",
                         containerBorderColor(ThemeManager::instance().current()));
         pane.renderedContainer = rc;
     }
     auto* rvLayout = new QVBoxLayout(pane.renderedContainer);
-    rvLayout->setContentsMargins(1, 1, 1, 1);   // room for the 1px border
+    rvLayout->setContentsMargins(0, 0, 0, 0);
     rvLayout->setSpacing(0);
     pane.rendered = new QsciScintilla;
     setupRenderedSci(pane.rendered);
     rvLayout->addWidget(pane.rendered);
 
-    // In Both mode, clicking generated code reveals the corresponding node
-    // in Structure without changing its selection or opening folded parents.
+    // Explicit Code clicks navigate visible Structure panes without opening folds.
     auto syncCodeLineToStructure = [this, ctrl = tab.ctrl, doc = tab.doc,
                                     code = pane.rendered](int line) {
-        bool inBoth = false;
+        bool hasStructure = false;
         for (auto it = m_tabs.begin(); it != m_tabs.end(); ++it) {
             if (it->ctrl != ctrl) continue;
             for (const auto& candidate : it->panes)
-                if (candidate.rendered == code && candidate.viewMode == VM_Both) {
-                    inBoth = true;
-                    break;
-                }
+                hasStructure |= candidate.viewMode == VM_Reclass && candidate.editor->isVisible();
             break;
         }
-        if (!inBoth || !code->hasFocus() || line < 0 || line >= code->lines()) return;
+        if (!hasStructure || !code->hasFocus() || line < 0 || line >= code->lines()) return;
         const QString text = code->text(line);
         const auto identifier = [](QString name) {
             for (QChar& ch : name)
@@ -3693,40 +3704,27 @@ MainWindow::SplitPane MainWindow::createSplitPane(TabState& tab) {
     // Find bar with prev/next buttons (hidden by default)
     pane.findContainer = new QWidget;
     auto* fcLayout = new QHBoxLayout(pane.findContainer);
-    fcLayout->setContentsMargins(4, 1, 4, 1);
-    fcLayout->setSpacing(2);
-    const auto& fbTheme = ThemeManager::instance().current();
-    auto* ccPrevBtn = new QToolButton;
-    ccPrevBtn->setText(QStringLiteral("\u25C0"));
-    ccPrevBtn->setFixedSize(24, 24);
-    auto* ccNextBtn = new QToolButton;
-    ccNextBtn->setText(QStringLiteral("\u25B6"));
-    ccNextBtn->setFixedSize(24, 24);
-    auto* ccCloseBtn = new QToolButton;
-    ccCloseBtn->setText(QStringLiteral("\u2715"));
-    ccCloseBtn->setFixedSize(24, 24);
-    QString btnCss = QStringLiteral(
-        "QToolButton { background: %1; color: %2; border: 1px solid %3; border-radius: 2px; }"
-        "QToolButton:hover { background: %4; }"
-        "QToolButton:pressed { background: %5; }")
-            .arg(fbTheme.background.name(), fbTheme.text.name(), fbTheme.border.name(),
-                 fbTheme.hover.name(), fbTheme.backgroundAlt.name());
-    ccPrevBtn->setStyleSheet(btnCss);
-    ccNextBtn->setStyleSheet(btnCss);
-    ccCloseBtn->setStyleSheet(btnCss);
-    pane.findBar = new QLineEdit;
-    pane.findBar->setPlaceholderText("Find...");
-    pane.findBar->setFixedHeight(24);
-    pane.findBar->setStyleSheet(
-        QStringLiteral("QLineEdit { background: %1; color: %2; border: 1px solid %3;"
-                        " padding: 2px 6px; font-size: 13px; }"
-                        "QLineEdit:focus { border-color: %4; }")
-            .arg(fbTheme.backgroundAlt.name(), fbTheme.text.name(),
-                 fbTheme.border.name(), fbTheme.borderFocused.name()));
+    fcLayout->setContentsMargins(kGutter, 0, kGutter, 0);
+    fcLayout->setSpacing(0);
+    auto* ccPrevBtn = makeHeaderToolButton(":/vsicons/arrow-up.svg", "Previous match", pane.findContainer);
+    auto* ccNextBtn = makeHeaderToolButton(":/vsicons/arrow-down.svg", "Next match", pane.findContainer);
+    auto* ccCloseBtn = makeHeaderToolButton(":/vsicons/close.svg", "Close find", pane.findContainer);
+    auto* codeSearch = new PanelSearchField(":/vsicons/search.svg", "Find in code", pane.findContainer);
+    pane.findBar = codeSearch;
+    auto styleFind = [codeSearch, ccPrevBtn, ccNextBtn, ccCloseBtn](const Theme& t) {
+        codeSearch->applyTheme(t);
+        for (auto* button : {ccPrevBtn, ccNextBtn, ccCloseBtn}) {
+            button->setStyleSheet(paneToolButtonStyle(t) + "QToolButton { padding: 0px; }");
+            button->setIcon(themedVsIcon(button->property("rcxIconPath").toString(),
+                                        t.textDim, kDockHeaderIcon, button->devicePixelRatioF()));
+        }
+    };
+    styleFind(ThemeManager::instance().current());
+    connect(&ThemeManager::instance(), &ThemeManager::themeChanged, pane.findContainer, styleFind);
+    fcLayout->addWidget(pane.findBar, 1);
     fcLayout->addWidget(ccPrevBtn);
     fcLayout->addWidget(ccNextBtn);
     fcLayout->addWidget(ccCloseBtn);
-    fcLayout->addWidget(pane.findBar);
     pane.findContainer->setVisible(false);
     rvLayout->addWidget(pane.findContainer);
 
@@ -3789,121 +3787,87 @@ MainWindow::SplitPane MainWindow::createSplitPane(TabState& tab) {
     codePageLay->addWidget(pane.renderedContainer);
     pane.tabWidget->addTab(pane.codePage, rcx::kPaneTabs[1].name);      // "Code"
 
+    pane.graphView = new TypeGraphView(pane.tabWidget);
+    pane.graphView->treeSource = [guard = QPointer<RcxController>(tab.ctrl)]() -> const NodeTree* {
+        return guard ? &guard->document()->tree : nullptr;
+    };
+    pane.graphView->rootSource = [guard = QPointer<RcxController>(tab.ctrl)] {
+        return guard ? guard->viewRootId() : uint64_t(0);
+    };
+    pane.graphView->openType = [guard = QPointer<RcxController>(tab.ctrl)](uint64_t id) {
+        if (guard) emit guard->requestOpenStructInNewTab(id);
+    };
+    pane.tabWidget->addTab(pane.graphView, rcx::kPaneTabs[2].name);
+
     // Create Debug view: plain-text Scintilla showing composed text with visible special chars
     pane.debugView = new QsciScintilla;
     setupDebugSci(pane.debugView);
-    pane.tabWidget->addTab(pane.debugView, rcx::kPaneTabs[2].name);     // "Debug"
+    pane.tabWidget->addTab(pane.debugView, rcx::kPaneTabs[3].name);     // "Debug"
 
-    // "Both" — index 3 — a real view that shows the hex editor (Structure, 67%)
-    // and the generated Code (33%) side by side IN THIS pane. The single tab
-    // bar + corner (zoom, format/scope/gear) drive both. On entering/leaving
-    // the tab the editorContainer/renderedContainer are reparented between
-    // their own pages and bothSplitter (see the currentChanged handler).
-    pane.bothSplitter = new QSplitter(Qt::Horizontal);
-    pane.bothSplitter->setHandleWidth(1);
-    pane.bothSplitter->setChildrenCollapsible(false);
-    pane.tabWidget->addTab(pane.bothSplitter, rcx::kPaneTabs[3].name);  // "Both"
     // Every tab says what it shows — the strip is the only place view mode is
     // switched, so it has to explain itself.
     for (int ti = 0; ti < rcx::kPaneTabCount && ti < pane.tabWidget->count(); ++ti)
         pane.tabWidget->setTabToolTip(ti, QString::fromLatin1(rcx::kPaneTabs[ti].tip));
 
-    // Corner widget: format combo + gear icon
+    // Code has one short toolbar. Zoom lives in View options and Ctrl+wheel.
     {
         const auto& ct = ThemeManager::instance().current();
         QSettings cs("RC", "RC");
-        QString ef = cs.value("font", "JetBrains Mono").toString();
-
-        auto* cornerWidget = new QWidget;
-        // Named so rcx::paneTabStyle can give it the strip's surface — see the
-        // #rcxPaneCorner rule there.
-        cornerWidget->setObjectName(QStringLiteral("rcxPaneCorner"));
-        // Pin the corner strip to the SAME height as the tabs (26px, set in
-        // rcx::paneTabStyle) so AlignVCenter on its children actually
-        // centers them against the Structure/Code/Debug tab text —
-        // otherwise QTabWidget gives the shorter corner widget its own height
-        // and the row floats above the tab baseline.
-        cornerWidget->setFixedHeight(26);
+        auto* cornerWidget = new PaneToolbar(pane.codePage);
+        cornerWidget->setObjectName("rcxPaneCorner");
         auto* cornerLayout = new QHBoxLayout(cornerWidget);
-        cornerLayout->setContentsMargins(0, 0, 4, 0);
-        cornerLayout->setSpacing(2);
-
-        pane.fmtCombo = new QComboBox;
+        cornerLayout->setContentsMargins(kGutter, 2, kGutter, 2);
+        cornerLayout->setSpacing(8);
+        auto label = [&](const QString& text) {
+            auto* l = new QLabel(text, cornerWidget);
+            l->setProperty("paneRole", "label");
+            l->setFont(chromeFont());
+            l->setStyleSheet("color: " + ct.textDim.name());
+            cornerLayout->addWidget(l);
+        };
+        label("Language");
+        pane.fmtCombo = new PaneComboBox(cornerWidget);
         for (int fi = 0; fi < static_cast<int>(CodeFormat::_Count); ++fi)
             pane.fmtCombo->addItem(codeFormatName(static_cast<CodeFormat>(fi)));
         pane.fmtCombo->setCurrentIndex(cs.value("codeFormat", 0).toInt());
-        pane.fmtCombo->setFixedHeight(22);
-        pane.fmtCombo->setStyleSheet(QStringLiteral(
-            "QComboBox { background: %1; color: %2; border: 1px solid %3;"
-            " padding: 1px 6px; font-family: '%6'; font-size: 9pt; }"
-            "QComboBox:focus { border-color: %7; }"
-            "QComboBox::drop-down { border: none; width: 14px; }"
-            "QComboBox::down-arrow { image: url(:/vsicons/chevron-down.svg);"
-            " width: 10px; height: 10px; }"
-            "QComboBox QAbstractItemView { background: %4; color: %2;"
-            " selection-background-color: %5; border: 1px solid %3; }")
-            .arg(ct.background.name(), ct.textMuted.name(), ct.border.name(),
-                 ct.backgroundAlt.name(), ct.hover.name(), ef,
-                 ct.borderFocused.name()));
-
-        pane.fmtGear = new QToolButton;
-        pane.fmtGear->setIcon(QIcon(":/vsicons/settings-gear.svg"));
-        pane.fmtGear->setFixedSize(22, 22);
-        pane.fmtGear->setToolTip("Generator Options");
-        pane.fmtGear->setStyleSheet(QStringLiteral(
-            "QToolButton { background: %1; color: %2; border: 1px solid %3; border-radius: 0px; }"
-            "QToolButton:hover { background: %4; }")
-            .arg(ct.background.name(), ct.textMuted.name(), ct.border.name(),
-                 ct.hover.name()));
-
-        pane.scopeCombo = new QComboBox;
+        pane.fmtCombo->setAccessibleName("Code language");
+        pane.fmtCombo->setToolTip("Generated code language");
+        pane.fmtCombo->setFixedHeight(kEditorBarControlHeight);
+        pane.fmtCombo->setMinimumWidth(90);
+        pane.fmtCombo->setStyleSheet(paneComboStyle(ct));
+        cornerLayout->addWidget(pane.fmtCombo);
+        label("Include");
+        pane.scopeCombo = new PaneComboBox(cornerWidget);
         for (int si = 0; si < static_cast<int>(CodeScope::_Count); ++si)
             pane.scopeCombo->addItem(codeScopeName(static_cast<CodeScope>(si)));
         pane.scopeCombo->setCurrentIndex(cs.value("codeScope", 1).toInt());
-        pane.scopeCombo->setFixedHeight(22);
-        pane.scopeCombo->setStyleSheet(pane.fmtCombo->styleSheet());
-
-        cornerLayout->addWidget(pane.fmtCombo);
+        pane.scopeCombo->setAccessibleName("Types to include");
+        pane.scopeCombo->setToolTip("Choose which type definitions to generate");
+        pane.scopeCombo->setProperty("paneRole", "scope");
+        pane.scopeCombo->setFixedHeight(kEditorBarControlHeight);
+        pane.scopeCombo->setStyleSheet(paneComboStyle(ct));
         cornerLayout->addWidget(pane.scopeCombo);
+        cornerLayout->addStretch();
+        auto* copy = new QToolButton(cornerWidget);
+        copy->setText("Copy code"); copy->setAccessibleName("Copy code");
+        copy->setToolTip("Copy all generated code to the clipboard");
+        copy->setFixedHeight(kEditorBarControlHeight); copy->setStyleSheet(paneToolButtonStyle(ct));
+        connect(copy, &QToolButton::clicked, pane.rendered, [view = pane.rendered, copy] {
+            QApplication::clipboard()->setText(view->text());
+            copy->setText("Copied");
+            QTimer::singleShot(1500, copy, [copy] { copy->setText("Copy code"); });
+        });
+        cornerLayout->addWidget(copy);
+        pane.fmtGear = new QToolButton(cornerWidget);
+        pane.fmtGear->setText("Options..."); pane.fmtGear->setToolTip("Code generation options");
+        pane.fmtGear->setProperty("paneRole", "options");
+        pane.fmtGear->setFixedHeight(kEditorBarControlHeight);
+        pane.fmtGear->setStyleSheet(paneToolButtonStyle(ct));
         cornerLayout->addWidget(pane.fmtGear);
+        codePageLay->insertWidget(0, cornerWidget);
+        pane.viewStrip->setControls(cornerWidget);
 
-        // ── Zoom — a discoverable handle for the EXISTING Scintilla zoom
-        // (the same thing Ctrl+wheel drives). Always visible, separated to the
-        // right of the Code-only controls. A slider over the zoom level (point
-        // delta) plus a "%" readout. Bidirectional: the slider drives zoomTo()
-        // and SCN_ZOOM (Ctrl+wheel) drives the slider.
-        cornerLayout->addSpacing(10);
-        // Match the rendered tab text: the tabs use font-size 10pt + the editor
-        // font family via the QTabBar stylesheet above (NOT tabBar()->font(),
-        // which returns the smaller default widget font). Mirror that here so
-        // "Zoom 100%" reads at the same size as Structure/Code/Debug.
-        const QFont tabFont(ef, 10);
-        auto* zoomCap = new QLabel(QStringLiteral("Zoom"), cornerWidget);
-        zoomCap->setFont(tabFont);
-        zoomCap->setStyleSheet(QStringLiteral(
-            "color: %1; padding-right: 2px;").arg(ct.textMuted.name()));
-        auto* zoomSlider = new rcx::ZoomSlider;
-        zoomSlider->applyTheme(ct);
-        pane.zoomSlider = zoomSlider;
-        pane.zoomLabel = new QLabel(QStringLiteral("100%"), cornerWidget);
-        pane.zoomLabel->setFont(tabFont);
-        pane.zoomLabel->setAlignment(Qt::AlignVCenter | Qt::AlignLeft);
-        pane.zoomLabel->setStyleSheet(QStringLiteral(
-            "color: %1; padding-left: 4px;").arg(ct.textMuted.name()));
-        // Keep the slider stationary when the readout crosses 100%.
-        pane.zoomLabel->setFixedWidth(QFontMetrics(tabFont).horizontalAdvance(QStringLiteral("100%")) + 4);
-        cornerLayout->addWidget(zoomCap, 0, Qt::AlignVCenter);
-        cornerLayout->addWidget(pane.zoomSlider, 0, Qt::AlignVCenter);
-        cornerLayout->addWidget(pane.zoomLabel, 0, Qt::AlignVCenter);
-
-        // Code-only controls (format/scope/gear) hidden until the Code tab is
-        // selected; the zoom control stays visible on every tab.
-        pane.fmtCombo->setVisible(false);
-        pane.scopeCombo->setVisible(false);
-        pane.fmtGear->setVisible(false);
-        pane.tabWidget->setCornerWidget(cornerWidget, Qt::BottomRightCorner);
-
-        // Apply the saved zoom level to this pane's views + slider/readout,
+        // Apply the saved zoom level to this pane's text views,
         // before wiring change signals (so this doesn't bounce).
         {
             int savedLevel = cs.value("viewZoomLevel", 0).toInt();
@@ -3913,7 +3877,7 @@ MainWindow::SplitPane MainWindow::createSplitPane(TabState& tab) {
         auto refreshAllRendered = [this]() {
             for (auto& tab : m_tabs)
                 for (auto& p : tab.panes)
-                    if (p.viewMode == VM_Rendered || p.viewMode == VM_Both)
+                    if (p.viewMode == VM_Rendered)
                         updateRenderedView(tab, p);
         };
 
@@ -3935,14 +3899,8 @@ MainWindow::SplitPane MainWindow::createSplitPane(TabState& tab) {
                     if (p.scopeCombo && p.scopeCombo->currentIndex() != idx)
                         p.scopeCombo->setCurrentIndex(idx);
         });
-        // Slider → drive Scintilla zoom on this pane's views.
+        // Ctrl+wheel on a text view keeps the pane's text zoom synchronized.
         QTabWidget* zw = pane.tabWidget;
-        connect(pane.zoomSlider, &QSlider::valueChanged, this, [this, zw](int level) {
-            if (SplitPane* p = findPaneByTabWidget(zw)) applyPaneZoom(*p, level);
-        });
-        // Ctrl+wheel (SCN_ZOOM) on any view → mirror its level back to the
-        // slider + the pane's other views. applyPaneZoom blocks the views'
-        // signals while zooming, so this can't recurse.
         auto wireZoomSync = [this, zw](QsciScintilla* s) {
             if (!s) return;
             connect(s, &QsciScintillaBase::SCN_ZOOM, this, [this, zw, s]() {
@@ -3961,39 +3919,72 @@ MainWindow::SplitPane MainWindow::createSplitPane(TabState& tab) {
     pane.tabWidget->setCurrentIndex(0);
     pane.viewMode = VM_Reclass;
 
-    // Right-click on the Structure/Code/Debug tab bar → quick split/unsplit
-    // and tab switching. The split offers go through the same splitView
-    // path as Ctrl+\, so the splitter flips to vertical (south stack) and
-    // a new pane appends below.
-    {
-        QTabBar* tabBar = pane.tabWidget->tabBar();
-        tabBar->setContextMenuPolicy(Qt::CustomContextMenu);
-        QTabWidget* tw = pane.tabWidget;
-        connect(tabBar, &QWidget::customContextMenuRequested, this,
-                [this, tw, tabBar](const QPoint& pos) {
-            QMenu menu;
-            int tabIdx = tabBar->tabAt(pos);
-            if (tabIdx >= 0 && tabIdx != tw->currentIndex()) {
-                menu.addAction(QStringLiteral("Open '%1'").arg(tw->tabText(tabIdx)),
-                    [tw, tabIdx]() { tw->setCurrentIndex(tabIdx); });
-                menu.addSeparator();
-            }
-            menu.addAction(QStringLiteral("Split View &Below"),
-                this, &MainWindow::splitView);
-            if (auto* t = activeTab(); t && t->panes.size() > 1) {
-                menu.addAction(QStringLiteral("&Unsplit View"),
-                    this, &MainWindow::unsplitView);
-            }
-            menu.exec(tabBar->mapToGlobal(pos));
-        });
-    }
-
-    // Add to splitter
-    // The PANE draws the outline now, not the content: one box around the
-    // editor AND its view tabs, the same in all four view modes (see
-    // rcx::PaneBox in widgets/pane_tabs.h for why the content stopped).
+    pane.tabWidget->tabBar()->setTabVisible(3, false);
     pane.paneBox = new rcx::PaneBox(pane.tabWidget);
-    tab.splitter->addWidget(pane.paneBox);
+    QTabWidget* paneKey = pane.tabWidget;
+    pane.viewStrip->chooseView = [this, paneKey](int mode) {
+        activatePane(paneKey);
+        if (mode == 3) paneKey->tabBar()->setTabVisible(3, true);
+        paneKey->setCurrentIndex(mode);
+    };
+    pane.viewStrip->activated = [this, paneKey] { activatePane(paneKey); };
+    pane.viewStrip->splitView = [this, paneKey](Qt::Orientation direction, int mode) { splitPane(paneKey, direction, mode); };
+    pane.viewStrip->closePane = [this, paneKey] { closePane(paneKey); };
+    pane.viewStrip->pairViews = [this, paneKey] { pairPane(paneKey); };
+    pane.viewStrip->canSplit = [this, paneKey](Qt::Orientation direction) {
+        auto* p = findPaneByTabWidget(paneKey); if (!p) return false;
+        return direction == Qt::Horizontal ? p->paneBox->width() >= 608 : p->paneBox->height() >= 308;
+    };
+    pane.viewStrip->previewPlacement = [this, paneKey](int direction) {
+        if (auto* p = findPaneByTabWidget(paneKey)) static_cast<PaneBox*>(p->paneBox)->previewPlacement(direction);
+    };
+    pane.viewStrip->maximize = [this, paneKey] {
+        activatePane(paneKey);
+        auto* tab = activeTab(); if (!tab || tab->panes.size() < 2) return;
+        if (tab->maximizedPane) { restoreViews(); return; }
+        if (auto* p = findPaneByTabWidget(paneKey)) {
+            maximizePaneLeaf(p->paneBox, tab->splitter); tab->maximizedPane = paneKey;
+            p->viewStrip->setMaximized(true);
+        }
+    };
+    pane.viewStrip->equalize = [this, paneKey] {
+        activatePane(paneKey); restoreViews();
+        if (auto* tab = activeTab()) equalizePaneLayout(tab->splitter);
+    };
+    pane.viewStrip->keepOnly = [this, paneKey] {
+        activatePane(paneKey); restoreViews();
+        auto* tab = activeTab(); if (!tab) return;
+        QList<QTabWidget*> others;
+        for (const auto& p : tab->panes) if (p.tabWidget != paneKey) others.append(p.tabWidget);
+        for (auto* other : others) closePane(other);
+        activatePane(paneKey);
+    };
+    pane.viewStrip->populateControls = [this, paneKey](QMenu* menu) {
+        auto* p = findPaneByTabWidget(paneKey); if (!p) return;
+        activatePane(paneKey);
+        if (p->viewMode == VM_Rendered) {
+            auto addChoices = [menu](const QString& title, QComboBox* combo) {
+                auto* sub = menu->addMenu(title);
+                for (int i = 0; i < combo->count(); ++i) {
+                    auto* action = sub->addAction(combo->itemText(i), combo, [combo, i] { combo->setCurrentIndex(i); });
+                    action->setCheckable(true); action->setChecked(combo->currentIndex() == i);
+                }
+            };
+            if (!p->fmtCombo->isVisible()) addChoices("Language", p->fmtCombo);
+            if (!p->scopeCombo->isVisible()) addChoices("Include types", p->scopeCombo);
+            if (!p->fmtGear->isVisible()) menu->addAction("Code generation options", p->fmtGear, &QToolButton::click);
+            if (!menu->isEmpty()) menu->addSeparator();
+        }
+        if (p->viewMode == VM_Graph) {
+            menu->addAction("Fit graph", p->graphView, [view = p->graphView] { view->fitGraph(); });
+            menu->addAction("Zoom in", p->graphView, [view = p->graphView] { view->zoomBy(1.2); });
+            menu->addAction("Zoom out", p->graphView, [view = p->graphView] { view->zoomBy(1 / 1.2); });
+            return;
+        }
+        menu->addAction("Zoom in", this, [this, paneKey] { if (auto* p = findPaneByTabWidget(paneKey)) applyPaneZoom(*p, p->zoomLevel + 1); });
+        menu->addAction("Zoom out", this, [this, paneKey] { if (auto* p = findPaneByTabWidget(paneKey)) applyPaneZoom(*p, p->zoomLevel - 1); });
+        menu->addAction("Reset zoom", this, [this, paneKey] { if (auto* p = findPaneByTabWidget(paneKey)) applyPaneZoom(*p, 0); });
+    };
 
     // Connect per-pane page switching (driven by the pane view tabs)
     QTabWidget* tw = pane.tabWidget;
@@ -4001,38 +3992,28 @@ MainWindow::SplitPane MainWindow::createSplitPane(TabState& tab) {
         SplitPane* p = findPaneByTabWidget(tw);
         if (!p) return;
 
-        // Reparent the shared editor / rendered views for the selected layout.
-        // (addWidget reparents; for Both the two addWidget calls always leave
-        // the order [editor, rendered] regardless of where they were before.)
-        if (index == 0 && p->reclassPage && p->editorContainer) {
-            p->reclassPage->layout()->addWidget(p->editorContainer);
-        } else if (index == 1 && p->codePage && p->renderedContainer) {
-            p->codePage->layout()->addWidget(p->renderedContainer);
-        } else if (index == 3 && p->bothSplitter) {
-            if (p->editorContainer)   p->bothSplitter->addWidget(p->editorContainer);
-            if (p->renderedContainer) p->bothSplitter->addWidget(p->renderedContainer);
-            p->bothSplitter->setSizes({ 67, 33 });  // Reclass 67% | Code 33%
-        }
-
-        // Format/scope/gear belong to the Code render — show for Code AND Both.
-        const bool codeish = (index == 1 || index == 3);
+        // Format/scope/gear belong to the Code render — show only for Code.
+        const bool codeish = (index == 1);
         if (p->fmtCombo)   p->fmtCombo->setVisible(codeish);
         if (p->scopeCombo) p->scopeCombo->setVisible(codeish);
         if (p->fmtGear)    p->fmtGear->setVisible(codeish);
 
         if (index == 0)      p->viewMode = VM_Reclass;
         else if (index == 1) p->viewMode = VM_Rendered;
-        else if (index == 3) p->viewMode = VM_Both;
+        else if (index == 2) p->viewMode = VM_Graph;
         else                 p->viewMode = VM_Debug;
+        p->viewStrip->setView(index);
+        activatePane(tw);
 
-        // Refresh the views the new layout shows: Code render for Code/Both,
+        // Refresh the views the new layout shows: generated text for Code,
         // debug text for Debug. (The editor/Reclass side is always live.)
-        if (index == 1 || index == 2 || index == 3) {
+        if (index >= 1 && index <= 3) {
             for (auto& tab : m_tabs) {
                 for (auto& pane : tab.panes) {
                     if (&pane == p) {
-                        if (index == 2) updateDebugView(tab, pane);
-                        else            updateRenderedView(tab, pane);  // Code or Both
+                        if (index == 3) updateDebugView(tab, pane);
+                        else if (index == 2) pane.graphView->refresh();
+                        else            updateRenderedView(tab, pane);  // Code
                         break;
                     }
                 }
@@ -4040,6 +4021,7 @@ MainWindow::SplitPane MainWindow::createSplitPane(TabState& tab) {
         }
     });
 
+    pane.viewStrip->setView(0);
     return pane;
 }
 
@@ -4196,8 +4178,11 @@ QDockWidget* MainWindow::createSentinelDock() {
 
 QDockWidget* MainWindow::createTab(RcxDocument* doc) {
     PROFILE_SCOPE("MainWindow::createTab");
-    auto* splitter = new QSplitter(Qt::Horizontal);
-    splitter->setHandleWidth(1);
+    auto* splitter = new PaneSplitter(Qt::Horizontal);
+    splitter->setHandleWidth(8);
+    splitter->setChildrenCollapsible(false);
+    splitter->setStyleSheet(QStringLiteral("QSplitter::handle { background: %1; }")
+        .arg(containerBorderColor(ThemeManager::instance().current()).name()));
     auto* ctrl = new RcxController(doc, splitter);
     if (doc == m_demoDocument) {
         RcxController* source = nullptr;
@@ -4361,6 +4346,8 @@ QDockWidget* MainWindow::createTab(RcxDocument* doc) {
 
     // Create the initial split pane
     tab.panes.append(createSplitPane(tab));
+    tab.splitter->addWidget(tab.panes.last().paneBox);
+    updatePaneAffordances(tab);
     tab.timeline = timelineStrip;
     bindTimelineStrip(tab);
 
@@ -4479,7 +4466,7 @@ QDockWidget* MainWindow::createTab(RcxDocument* doc) {
                 if (!name.isEmpty() && name.front().isDigit()) name.prepend(QChar('_'));
                 if (!name.isEmpty()) {
                     for (auto& pane : it->panes) {
-                        if (pane.viewMode != VM_Both || !pane.rendered) continue;
+                        if (pane.viewMode != VM_Rendered || !pane.rendered || pane.rendered->hasFocus()) continue;
                         for (int line = 0; line < pane.rendered->lines(); ++line) {
                             const QString codeLine = pane.rendered->text(line);
                             const int at = codeLine.indexOf(name);
@@ -4625,11 +4612,10 @@ QDockWidget* MainWindow::createTab(RcxDocument* doc) {
                     // Only regenerate rendered/debug panes if any are actually visible.
                     // This undo-stack path is the ONLY rendered refresh for edits +
                     // undo/redo (applyCommand→refresh() emits no documentChanged), so
-                    // it MUST include VM_Both or the Code half of "Both" goes stale on
-                    // every edit/undo/redo.
+                    // Keep every visible Code pane current on edit/undo/redo.
                     bool hasRendered = false, hasDebug = false;
                     for (const auto& pane : it2->panes) {
-                        if ((pane.viewMode == VM_Rendered || pane.viewMode == VM_Both)
+                        if ((pane.viewMode == VM_Rendered)
                             && pane.rendered && pane.rendered->isVisible())
                             hasRendered = true;
                         if (pane.viewMode == VM_Debug && pane.debugView && pane.debugView->isVisible())
@@ -5422,11 +5408,11 @@ bool MainWindow::eventFilter(QObject* obj, QEvent* event) {
             QString path = QCoreApplication::applicationDirPath()
                          + QStringLiteral("/issue.png");
             if (!pix.isNull() && pix.save(path, "PNG")) {
-                setAppStatus(QStringLiteral("Screenshot → ") + path);
+                showStatusNotification(QStringLiteral("Screenshot saved → ") + path);
                 qDebug() << "[Screenshot] saved" << path
                          << pix.width() << "x" << pix.height();
             } else {
-                setAppStatus(QStringLiteral("Screenshot FAILED: ") + path);
+                showStatusNotification(QStringLiteral("Screenshot FAILED: ") + path, 8000);
             }
             return true;
         }
@@ -5904,96 +5890,309 @@ void MainWindow::duplicateNodeAction() {
     if (ni >= 0) ctrl->duplicateNode(ni);
 }
 
-void MainWindow::splitView() {
+void MainWindow::activatePane(QTabWidget* source) {
+    for (auto it = m_tabs.begin(); it != m_tabs.end(); ++it) {
+        for (int i = 0; i < it->panes.size(); ++i) {
+            if (it->panes[i].tabWidget != source) continue;
+            if (m_activeDocDock != it.key()) setActiveDocDock(it.key());
+            it->activePaneIdx = i;
+            updatePaneAffordances(*it);
+            return;
+        }
+    }
+}
+
+void MainWindow::updatePaneAffordances(TabState& tab) {
+    for (int i = 0; i < tab.panes.size(); ++i) {
+        auto& pane = tab.panes[i];
+        pane.viewStrip->setCanClose(tab.panes.size() > 1);
+        static_cast<PaneBox*>(pane.paneBox)->setPaneActive(tab.panes.size() > 1 && i == tab.activePaneIdx);
+    }
+}
+
+void MainWindow::restoreViews() {
+    auto* tab = activeTab(); if (!tab || !tab->maximizedPane) return;
+    restorePaneLayout(tab->splitter); tab->maximizedPane.clear();
+    for (auto& p : tab->panes) p.viewStrip->setMaximized(false);
+}
+
+void MainWindow::splitPane(QTabWidget* source, Qt::Orientation direction, int mode) {
+    activatePane(source);
+    restoreViews();
     auto* tab = activeTab();
-    if (!tab) return;
-    // Split south (Structure on top, Code below). The splitter is created
-    // Qt::Horizontal in createTab so the workspace dock layout has a
-    // natural left-right metaphor; for in-tab pane splits the user
-    // wants stacked vertically so they can read full-width rows of
-    // both views at once.
-    if (tab->splitter)
-        tab->splitter->setOrientation(Qt::Vertical);
-    tab->panes.append(createSplitPane(*tab));
-    // The new pane's editor must feed the ribbon's inline-edit tracking too.
+    auto* found = findPaneByTabWidget(source);
+    if (!tab || !found) return;
+    if (found->viewStrip->canSplit && !found->viewStrip->canSplit(direction)) return;
+    const SplitPane original = *found; // QVector growth invalidates references.
+    if (mode < 0) mode = source->currentIndex();
+    struct TextState { int top, x, anchor, caret; };
+    auto capture = [](QsciScintilla* sci) {
+        return TextState{sci->firstVisibleLine(), int(sci->SendScintilla(QsciScintillaBase::SCI_GETXOFFSET)),
+            int(sci->SendScintilla(QsciScintillaBase::SCI_GETANCHOR)), int(sci->SendScintilla(QsciScintillaBase::SCI_GETCURRENTPOS))};
+    };
+    const TextState states[] = {capture(original.editor->scintilla()), capture(original.rendered), capture(original.debugView)};
+    const int selected = original.editor->currentNodeIndex();
+    const uint64_t selectedId = selected >= 0 && selected < tab->doc->tree.nodes.size() ? tab->doc->tree.nodes[selected].id : 0;
+    SplitPane added = createSplitPane(*tab);
+    tab->panes.append(added);
+    splitPaneLeaf(original.paneBox, added.paneBox, direction);
+    added.tabWidget->setCurrentIndex(mode);
+    applyPaneZoom(tab->panes.last(), original.zoomLevel);
+    if (selectedId) added.editor->selectNodeId(selectedId);
+    if (mode == 2 && original.viewMode == VM_Graph)
+        added.graphView->copyCameraFrom(*original.graphView);
+    // Restore after layout so resizing cannot clamp the original viewport early.
+    auto restore = [this, key = QPointer<QTabWidget>(added.tabWidget), oldKey = QPointer<QTabWidget>(source),
+                    first = states[0], code = states[1], debug = states[2], mode]() {
+        for (const auto& k : {oldKey, key}) {
+            if (!k) continue;
+            auto* p = findPaneByTabWidget(k); if (!p) continue;
+            const TextState values[] = {first, code, debug};
+            QsciScintilla* views[] = {p->editor->scintilla(), p->rendered, p->debugView};
+            for (int i = 0; i < 3; ++i) {
+                // A newly chosen view has freshly generated content, not a copy of a hidden view.
+                if (k == key && i != mode && !(i == 2 && mode == 3)) continue;
+                views[i]->SendScintilla(QsciScintillaBase::SCI_SETSEL, values[i].anchor, values[i].caret);
+                views[i]->SendScintilla(QsciScintillaBase::SCI_SETFIRSTVISIBLELINE, values[i].top);
+                views[i]->SendScintilla(QsciScintillaBase::SCI_SETXOFFSET, values[i].x);
+            }
+        }
+    };
+    QTimer::singleShot(0, this, restore);
+    activatePane(added.tabWidget);
+    if (mode == 0) added.editor->scintilla()->setFocus();
+    else if (mode == 1) added.rendered->setFocus();
+    else if (mode == 3) added.debugView->setFocus();
+    else added.graphView->setFocus();
     if (m_ribbonActions) m_ribbonActions->setActiveController(tab->ctrl);
 }
 
+void MainWindow::closePane(QTabWidget* source) {
+    for (auto it = m_tabs.begin(); it != m_tabs.end(); ++it) {
+        auto& tab = *it;
+        for (int index = 0; index < tab.panes.size(); ++index) {
+            if (tab.panes[index].tabWidget != source) continue;
+            if (tab.panes.size() == 1) return;
+            if (tab.maximizedPane) {
+                restorePaneLayout(tab.splitter); tab.maximizedPane.clear();
+                for (auto& p : tab.panes) p.viewStrip->setMaximized(false);
+            }
+            const bool wasActive = index == tab.activePaneIdx;
+            const auto removed = tab.panes.takeAt(index);
+            tab.ctrl->removeSplitEditor(removed.editor);
+            removePaneLeaf(removed.paneBox, tab.splitter);
+            if (index < tab.activePaneIdx) --tab.activePaneIdx;
+            tab.activePaneIdx = qBound(0, tab.activePaneIdx, int(tab.panes.size()) - 1);
+            updatePaneAffordances(tab);
+            if (wasActive) {
+                auto& next = tab.panes[tab.activePaneIdx];
+                activatePane(next.tabWidget);
+                next.tabWidget->currentWidget()->setFocus();
+            }
+            if (m_ribbonActions) m_ribbonActions->setActiveController(tab.ctrl);
+            return;
+        }
+    }
+}
+
+void MainWindow::pairPane(QTabWidget* source) {
+    activatePane(source);
+    source->setCurrentIndex(0);
+    splitPane(source, Qt::Horizontal, 1);
+}
+
+void MainWindow::splitView() {
+    if (auto* pane = findActiveSplitPane()) splitPane(pane->tabWidget, Qt::Vertical, pane->viewMode == VM_Reclass ? 1 : 0);
+}
+
 void MainWindow::unsplitView() {
+    if (auto* pane = findActiveSplitPane()) closePane(pane->tabWidget);
+}
+
+bool MainWindow::previewPaneLayout() {
     auto* tab = activeTab();
-    if (!tab || tab->panes.size() <= 1) return;
-    auto pane = tab->panes.takeLast();
-    tab->ctrl->removeSplitEditor(pane.editor);
-    pane.tabWidget->deleteLater();
-    tab->activePaneIdx = qBound(0, tab->activePaneIdx, tab->panes.size() - 1);
-    if (m_ribbonActions) m_ribbonActions->setActiveController(tab->ctrl);
+    if (!tab || tab->panes.isEmpty()) return false;
+    auto* original = tab->panes.first().tabWidget;
+    const QSize windowSize = size();
+    bool ok = true;
+    auto settle = [] { QApplication::processEvents(QEventLoop::ExcludeUserInputEvents); };
+    // Every view duplicates and closes through the real pane-specific paths.
+    for (int mode = 0; mode < 4; ++mode) {
+        original->setCurrentIndex(mode); settle();
+        splitPane(original, Qt::Horizontal); settle();
+        ok &= tab->panes.size() == 2 && tab->panes.last().tabWidget->currentIndex() == mode;
+        ok &= size() == windowSize;
+        closePane(tab->panes.last().tabWidget); settle();
+        ok &= tab->panes.size() == 1 && tab->splitter->count() == 1;
+    }
+    pairPane(original); settle();
+    auto* code = tab->panes.last().tabWidget;
+    auto* codeView = tab->panes.last().rendered;
+    auto* structure = tab->panes.first().editor;
+    int radius = -1, radiusLine = -1;
+    for (int i = 0; i < tab->doc->tree.nodes.size(); ++i)
+        if (tab->doc->tree.nodes[i].name == "radius") { radius = i; break; }
+    for (int line = 0; line < codeView->lines(); ++line)
+        if (codeView->text(line).contains(" radius")) { radiusLine = line; break; }
+    bool navigation = radius >= 0 && radiusLine >= 0;
+    if (navigation) {
+        QApplication::setActiveWindow(this);
+        QVector<bool> folds;
+        for (const auto& n : tab->doc->tree.nodes) folds.append(n.collapsed);
+        codeView->setFocus(); codeView->setCursorPosition(radiusLine, 0);
+        codeView->ensureLineVisible(radiusLine); settle();
+        const long pos = codeView->SendScintilla(QsciScintillaBase::SCI_POSITIONFROMLINE, radiusLine);
+        const QPointF at(codeView->SendScintilla(QsciScintillaBase::SCI_POINTXFROMPOSITION, 0UL, pos) + 4,
+                         codeView->SendScintilla(QsciScintillaBase::SCI_POINTYFROMPOSITION, 0UL, pos) + 4);
+        QMouseEvent release(QEvent::MouseButtonRelease, at, codeView->mapToGlobal(at.toPoint()),
+                            Qt::LeftButton, Qt::NoButton, Qt::NoModifier);
+        QApplication::sendEvent(codeView, &release); settle();
+        fprintf(stderr, "PANE_NAV_CODE radius=%d line=%d actual=%d focus=%d visible=%d\n",
+            radius, radiusLine, structure->currentNodeIndex(), codeView->hasFocus(), structure->isVisible());
+        navigation &= structure->currentNodeIndex() == radius;
+        codeView->SendScintilla(QsciScintillaBase::SCI_SETFIRSTVISIBLELINE, 0UL);
+        structure->scintilla()->setFocus();
+        structure->selectNodeId(tab->ctrl->viewRootId());
+        structure->selectNodeId(tab->doc->tree.nodes[radius].id);
+        int structureLine = 0, structureColumn = 0;
+        structure->scintilla()->getCursorPosition(&structureLine, &structureColumn);
+        emit structure->nodeClicked(structureLine, tab->doc->tree.nodes[radius].id, Qt::NoModifier);
+        settle();
+        navigation &= codeView->firstVisibleLine() > 0;
+        fprintf(stderr, "PANE_NAV_STRUCTURE top=%d selected=%d\n", codeView->firstVisibleLine(), structure->currentNodeIndex());
+        for (int i = 0; i < folds.size(); ++i) navigation &= folds[i] == tab->doc->tree.nodes[i].collapsed;
+    }
+    ok &= navigation;
+    fprintf(stderr, "PANE_NAVIGATION_RESULT %s\n", navigation ? "PASS" : "FAIL");
+    auto* outer = qobject_cast<QSplitter*>(tab->panes.first().paneBox->parentWidget());
+    splitPane(code, Qt::Vertical, 2); settle();
+    auto* graph = tab->panes.last().tabWidget;
+    ok &= tab->panes.size() == 3 && outer->orientation() == Qt::Horizontal;
+    ok &= qobject_cast<QSplitter*>(tab->panes.last().paneBox->parentWidget())->orientation() == Qt::Vertical;
+    // Remove the middle-created pane, keeping Graph and Structure intact.
+    closePane(code); settle();
+    ok &= tab->panes.size() == 2 && findPaneByTabWidget(graph) && findPaneByTabWidget(original);
+    ok &= size() == windowSize;
+    // Final review layout: Structure | (Graph above Code).
+    splitPane(graph, Qt::Vertical, 1); settle();
+    auto* lastKey = tab->panes.last().tabWidget;
+    tab->panes.last().viewStrip->maximize(); settle();
+    ok &= tab->maximizedPane == lastKey && !findPaneByTabWidget(original)->paneBox->isVisible();
+    findPaneByTabWidget(lastKey)->viewStrip->maximize(); settle();
+    ok &= !tab->maximizedPane && findPaneByTabWidget(original)->paneBox->isVisible();
+    findPaneByTabWidget(lastKey)->viewStrip->equalize(); settle();
+    findPaneByTabWidget(original)->viewStrip->keepOnly(); settle();
+    ok &= tab->panes.size() == 1 && tab->panes.first().tabWidget == original;
+    splitPane(original, Qt::Horizontal, 2); settle();
+    splitPane(tab->panes.last().tabWidget, Qt::Vertical, 1); settle();
+    // Optional visual review artifacts from the real panes and their real menus.
+    const QString reviewDir = qEnvironmentVariable("RCX_PANE_REVIEW_DIR");
+    if (!reviewDir.isEmpty()) {
+        QDir().mkpath(reviewDir);
+        for (auto& pane : tab->panes) {
+            auto* tabs = pane.tabWidget->tabBar();
+            for (int i = 0; i < 3; ++i)
+                ok &= tabs->rect().contains(tabs->tabRect(i));
+            const QString prefix = reviewDir + "/" + QString::number(pane.tabWidget->currentIndex());
+            pane.paneBox->grab().save(prefix + "-pane.png");
+            for (auto* button : pane.viewStrip->findChildren<QToolButton*>()) {
+                if (!button->menu()) continue;
+                auto* menu = button->menu();
+                menu->popup(button->mapToGlobal(QPoint(0, button->height())));
+                settle();
+                menu->grab().save(prefix + "-" + button->accessibleName().replace(' ', '-') + ".png");
+                menu->hide(); settle();
+            }
+        }
+    }
+    fprintf(stderr, "PANE_LAYOUT_RESULT %s panes=%d width=%d originalWidth=%d\n", ok ? "PASS" : "FAIL", int(tab->panes.size()), width(), windowSize.width());
+    fflush(stderr);
+    return ok;
+}
+
+void MainWindow::previewGraphView() {
+    if (auto* tab = activeTab(); tab && !tab->panes.isEmpty())
+        tab->panes.first().tabWidget->setCurrentIndex(2);
 }
 
 void MainWindow::previewBothSplit() {
     auto* tab = activeTab();
     if (!tab || tab->panes.isEmpty()) return;
-    tab->panes.first().tabWidget->setCurrentIndex(3);  // select the "Both" view
+    pairPane(tab->panes.first().tabWidget);
 }
 
 bool MainWindow::previewZoomInteraction() {
     auto* tab = activeTab();
     if (!tab || tab->panes.isEmpty()) return false;
     auto& pane = tab->panes.first();
-    auto* slider = pane.zoomSlider;
-    if (!slider) return false;
     QSettings settings("RC", "RC");
     const QVariant savedZoom = settings.value("viewZoomLevel");
+    const int savedMode = pane.tabWidget->currentIndex();
     bool ok = true;
-    int clicks = 0;
-    int blocked = 0, shifted = 0, unsynced = 0, unreachable = 0;
-    for (int mode = 0; mode < kPaneTabCount; ++mode) {
+    int actions = 0;
+    auto trigger = [&](const QString& label) {
+        QMenu menu;
+        pane.viewStrip->populateControls(&menu);
+        for (auto* action : menu.actions()) if (action->text() == label) {
+            action->trigger(); ++actions; return true;
+        }
+        return false;
+    };
+    for (int mode : {0, 1, 3}) {
         pane.tabWidget->setCurrentIndex(mode);
         QApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
-        const QRect anchor(slider->mapTo(this, QPoint()), slider->size());
-        for (int y : {1, slider->height() / 2, slider->height() - 2}) {
-            QSet<int> reached;
-            applyPaneZoom(pane, slider->maximum());
-            int previous = slider->minimum();
-            for (int x = 0; x < slider->width(); ++x) {
-                const QPoint at(x, y);
-                const QPoint global = slider->mapToGlobal(at);
-                // Route through the actual child under the pointer, so an
-                // overlapping corner/resize widget cannot silently pass.
-                QWidget* hit = childAt(mapFromGlobal(global));
-                if (hit != slider) { ++blocked; ok = false; continue; }
-                QMouseEvent press(QEvent::MouseButtonPress, at, global,
-                                  Qt::LeftButton, Qt::LeftButton, Qt::NoModifier);
-                QMouseEvent release(QEvent::MouseButtonRelease, at, global,
-                                    Qt::LeftButton, Qt::NoButton, Qt::NoModifier);
-                QApplication::sendEvent(hit, &press);
-                QApplication::sendEvent(hit, &release);
-                QApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
-                ++clicks;
-                const int level = slider->value();
-                reached.insert(level);
-                ok = level >= previous && ok;
-                previous = level;
-                if (QRect(slider->mapTo(this, QPoint()), slider->size()) != anchor) {
-                    ++shifted;
-                    ok = false;
-                }
-                for (auto* view : {pane.editor->scintilla(), pane.rendered, pane.debugView})
-                    if (view->SendScintilla(QsciScintillaBase::SCI_GETZOOM) != level) {
-                        ++unsynced;
-                        ok = false;
-                    }
-            }
-            for (int level = slider->minimum(); level <= slider->maximum(); ++level)
-                if (!reached.contains(level)) { ++unreachable; ok = false; }
-        }
+        applyPaneZoom(pane, 0);
+        ok &= trigger("Zoom in");
+        for (auto* view : {pane.editor->scintilla(), pane.rendered, pane.debugView})
+            ok &= view->SendScintilla(QsciScintillaBase::SCI_GETZOOM) == 1;
+        ok &= trigger("Zoom out");
+        ok &= pane.zoomLevel == 0;
+        trigger("Zoom in");
+        ok &= trigger("Reset zoom");
+        ok &= pane.zoomLevel == 0;
+        // Ctrl+wheel/Scintilla zoom still synchronizes with the menu state.
+        pane.rendered->zoomTo(2);
+        QApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
+        ok &= pane.zoomLevel == 2;
     }
-    // Leave the capture in Both at 100%, without changing the saved preference.
-    applyPaneZoom(pane, 0);
+    auto chromeMatchesTree = [&] {
+        const int height = pane.editor->addressBar()->height();
+        bool matches = height == kEditorBarHeight;
+        for (QWidget* bar : {pane.fmtCombo->parentWidget(),
+                            pane.graphView->findChild<QComboBox*>()->parentWidget()}) {
+            matches &= bar->height() == height;
+            for (auto* control : bar->findChildren<QWidget*>(QString(), Qt::FindDirectChildrenOnly))
+                if (control->isVisible()) matches &= bar->rect().contains(control->geometry());
+        }
+        return matches;
+    };
+    pane.tabWidget->setCurrentIndex(1);
+    for (int level = -8; level <= 20; ++level) {
+        applyPaneZoom(pane, level);
+        QApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
+        ok &= chromeMatchesTree();
+    }
+    pane.tabWidget->setCurrentIndex(2);
+    QApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
+    auto* canvas = pane.graphView->findChild<QGraphicsView*>();
+    const int textZoom = pane.zoomLevel;
+    const qreal scale = canvas->transform().m11();
+    ok &= trigger("Zoom in");
+    ok &= canvas->transform().m11() > scale && pane.zoomLevel == textZoom;
+    ok &= trigger("Zoom out");
+    ok &= qAbs(canvas->transform().m11() - scale) < .001;
+    ok &= trigger("Fit graph");
+    for (qreal target : {.15, .25, .5, 1.0, 1.5, 2.5}) {
+        pane.graphView->zoomBy(target / canvas->transform().m11());
+        QApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
+        ok &= chromeMatchesTree();
+    }
+    pane.graphView->fitGraph();
+    applyPaneZoom(pane, savedZoom.toInt());
+    pane.tabWidget->setCurrentIndex(savedMode);
     if (savedZoom.isValid()) settings.setValue("viewZoomLevel", savedZoom);
     else settings.remove("viewZoomLevel");
-    QApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
-    fprintf(stderr, "ZOOM_RESULT %s clicks=%d modes=%d blocked=%d shifted=%d unsynced=%d unreachable=%d\n",
-        ok ? "PASS" : "FAIL", clicks, kPaneTabCount, blocked, shifted, unsynced, unreachable);
+    fprintf(stderr, "ZOOM_RESULT %s actions=%d modes=4 textLevels=29 graphScales=6 toolbarHeight=%d\n", ok ? "PASS" : "FAIL", actions, pane.editor->addressBar()->height());
     fflush(stderr);
     return ok;
 }
@@ -6699,7 +6898,7 @@ void MainWindow::showShortcutsDialog() {
         {QStringLiteral("Bookmarks & Window"), {}, true},
         {QStringLiteral("Ctrl+B"),              QStringLiteral("Add bookmark...")},
         {QStringLiteral("Ctrl+Alt+B"),          QStringLiteral("Quick bookmark here")},
-        {QStringLiteral("Ctrl+\\"),             QStringLiteral("Split view below (RC / Code side-by-side)")},
+        {QStringLiteral("Ctrl+\\"),             QStringLiteral("Split below")},
         {QStringLiteral("Ctrl+Shift+\\"),       QStringLiteral("Unsplit view")},
         {QStringLiteral("Ctrl+Shift+[ / ]"),    QStringLiteral("Collapse all / expand all")},
         {QStringLiteral("F5"),                  QStringLiteral("Refresh")},
@@ -6884,7 +7083,7 @@ void MainWindow::applyTheme(const Theme& theme) {
         }
     }
 
-    // Restyle per-pane view tab bars (Structure / Code / Debug / Both).
+    // Restyle per-pane view tab bars (Structure / Code / Graph / Debug).
     // The literal that used to live here disagreed with the creation-time one
     // — chrome background instead of paper, a filled selected tab and a 3px
     // TOP accent — so the strip changed grammar on every theme switch. Both
@@ -6892,46 +7091,22 @@ void MainWindow::applyTheme(const Theme& theme) {
     {
         QString editorFont = QSettings("RC", "RC").value("font", "JetBrains Mono").toString();
         const QString tabSheet = rcx::paneTabStyle(theme, editorFont);
-        QString comboStyle = QStringLiteral(
-            "QComboBox { background: %1; color: %2; border: 1px solid %3;"
-            " padding: 1px 6px; font-family: '%6'; font-size: 9pt; }"
-            "QComboBox:focus { border-color: %7; }"
-            "QComboBox::drop-down { border: none; width: 14px; }"
-            "QComboBox::down-arrow { image: url(:/vsicons/chevron-down.svg);"
-            " width: 10px; height: 10px; }"
-            "QComboBox QAbstractItemView { background: %4; color: %2;"
-            " selection-background-color: %5; border: 1px solid %3; }")
-            .arg(theme.background.name(), theme.textMuted.name(), theme.border.name(),
-                 theme.backgroundAlt.name(), theme.hover.name(), editorFont,
-                 theme.borderFocused.name());
-        QString gearStyle = QStringLiteral(
-            "QToolButton { background: %1; color: %2; border: 1px solid %3; border-radius: 0px; }"
-            "QToolButton:hover { background: %4; }")
-            .arg(theme.background.name(), theme.textMuted.name(), theme.border.name(),
-                 theme.hover.name());
+        const QString comboStyle = paneComboStyle(theme, editorFont);
+        const QString gearStyle = paneToolButtonStyle(theme);
         for (auto it = m_tabs.begin(); it != m_tabs.end(); ++it) {
+            const auto splitStyle = QStringLiteral("QSplitter::handle { background: %1; }").arg(containerBorderColor(theme).name());
+            it->splitter->setStyleSheet(splitStyle);
+            for (auto* branch : it->splitter->findChildren<QSplitter*>()) branch->setStyleSheet(splitStyle);
             for (auto& pane : it->panes) {
                 if (pane.tabWidget)
                     pane.tabWidget->setStyleSheet(tabSheet);
+                if (pane.viewStrip) pane.viewStrip->applyTheme(theme);
                 if (pane.fmtCombo)
                     pane.fmtCombo->setStyleSheet(comboStyle);
                 if (pane.scopeCombo)
                     pane.scopeCombo->setStyleSheet(comboStyle);
                 if (pane.fmtGear)
                     pane.fmtGear->setStyleSheet(gearStyle);
-                if (pane.zoomSlider)
-                    pane.zoomSlider->applyTheme(theme);
-                // Refresh the dynamic property the custom
-                // EditorContainer::paintEvent reads, then trigger a repaint.
-                // Do NOT install a QSS border here — Qt would draw it as a
-                // Fusion bevel (2-pixel light/dark double line) on top of the
-                // custom paint. Both the hex editor and the Code view use it.
-                for (QWidget* ec : { pane.editorContainer, pane.renderedContainer }) {
-                    if (ec) {
-                        ec->setProperty("borderColor", containerBorderColor(theme));
-                        ec->update();
-                    }
-                }
                 // The minimap was absent from this path entirely, so its
                 // paper/text stayed on the theme that was active when the
                 // pane was built until the tab was reopened.
@@ -7431,7 +7606,7 @@ void MainWindow::createRibbon() {
             m_codeViewMenu = new QMenu(this);
             // Labels come from codeScopeName so the menu and the pane's scope
             // combo can never drift apart.
-            for (CodeScope sc : {CodeScope::WithChildren, CodeScope::FullSdk}) {
+            for (CodeScope sc : {CodeScope::Current, CodeScope::WithChildren, CodeScope::FullSdk}) {
                 m_codeViewMenu->addAction(QString::fromLatin1(codeScopeName(sc)), this,
                                           [this, sc]() { showCodeView(sc); });
             }
@@ -7997,7 +8172,7 @@ void MainWindow::setViewMode(ViewMode mode) {
     auto* pane = findActiveSplitPane();
     if (!pane) return;
     pane->viewMode = mode;
-    int idx = (mode == VM_Both) ? 3 : (mode == VM_Debug) ? 2
+    int idx = (mode == VM_Debug) ? 3 : (mode == VM_Graph) ? 2
             : (mode == VM_Rendered) ? 1 : 0;
     pane->tabWidget->setCurrentIndex(idx);
 }
@@ -8023,7 +8198,8 @@ uint64_t MainWindow::findRootStructForNode(const NodeTree& tree, uint64_t nodeId
 }
 
 void MainWindow::applyPaneZoom(SplitPane& p, int level) {
-    level = qBound(ZoomSlider::kMinimum, level, ZoomSlider::kMaximum);
+    level = qBound(-8, level, 20);
+    p.zoomLevel = level;
     QSettings("RC", "RC").setValue("viewZoomLevel", level);
     // Drive Scintilla's own zoom (the same SCI_SETZOOM that Ctrl+wheel uses) on
     // all three views so the pane stays consistent across tab switches. Block
@@ -8036,16 +8212,6 @@ void MainWindow::applyPaneZoom(SplitPane& p, int level) {
     setZoom(p.editor ? p.editor->scintilla() : nullptr);
     setZoom(p.rendered);
     setZoom(p.debugView);
-
-    if (p.zoomSlider && p.zoomSlider->value() != level) {
-        QSignalBlocker block(p.zoomSlider);
-        p.zoomSlider->setValue(level);
-    }
-    if (p.zoomLabel) {
-        // Approximate % off the 12pt base for a familiar readout.
-        int pct = qRound((12.0 + level) / 12.0 * 100.0);
-        p.zoomLabel->setText(QStringLiteral("%1%").arg(pct));
-    }
 }
 
 // ── Update the rendered view for a single pane ──
@@ -8069,7 +8235,7 @@ void MainWindow::showCodeView(CodeScope scope) {
 }
 
 void MainWindow::updateRenderedView(TabState& tab, SplitPane& pane) {
-    if (pane.viewMode != VM_Rendered && pane.viewMode != VM_Both) return;
+    if (pane.viewMode != VM_Rendered) return;
     if (!pane.rendered) return;
 
     // Determine which struct to render based on selection
@@ -8184,7 +8350,7 @@ void MainWindow::updateRenderedView(TabState& tab, SplitPane& pane) {
 
 void MainWindow::updateAllRenderedPanes(TabState& tab) {
     for (auto& pane : tab.panes) {
-        if (pane.viewMode == VM_Rendered || pane.viewMode == VM_Both)
+        if (pane.viewMode == VM_Rendered)
             updateRenderedView(tab, pane);
     }
 }
@@ -10270,7 +10436,7 @@ void MainWindow::createWorkspaceDock() {
                 auto& t = m_tabs[dockRef];
                 if (t.activePaneIdx >= 0 && t.activePaneIdx < t.panes.size()) {
                     auto& p = t.panes[t.activePaneIdx];
-                    if (p.viewMode == VM_Rendered || p.viewMode == VM_Both)
+                    if (p.viewMode == VM_Rendered)
                         updateRenderedView(t, p);
                 }
             });
@@ -10341,7 +10507,7 @@ void MainWindow::createWorkspaceDock() {
                 auto& t = m_tabs[dockRef];
                 if (t.activePaneIdx >= 0 && t.activePaneIdx < t.panes.size()) {
                     auto& p = t.panes[t.activePaneIdx];
-                    if (p.viewMode == VM_Rendered || p.viewMode == VM_Both)
+                    if (p.viewMode == VM_Rendered)
                         updateRenderedView(t, p);
                 }
             });
@@ -12419,7 +12585,7 @@ int main(int argc, char* argv[]) {
             // The example a first launch opens on, after it has run a while.
             bool showSim = (ssIdx + 2 < args.size()
                              && (args[ssIdx + 2] == "sim" || args[ssIdx + 2] == "simtimeline"
-                                 || args[ssIdx + 2] == "simworkspace" || showSources));
+                                 || args[ssIdx + 2] == "simworkspace" || args[ssIdx + 2] == "graph" || args[ssIdx + 2] == "panes" || showSources));
             // Ribbon captures: force a tab / the collapsed state for the shot.
             // The pre-existing settings are restored before quitting so a
             // screenshot run never rewrites the user's ribbon preferences.
@@ -12455,8 +12621,13 @@ int main(int argc, char* argv[]) {
                         if (ribbonMode == QLatin1String("simworkspace"))
                             window.applyLayoutPreset(rcx::Layout_Workspace);
                         QTimer::singleShot(3500, &window, [&window, ssPath, showSources, ribbonMode]() {
-                            const bool projectOk = ribbonMode != QLatin1String("simworkspace")
-                                || window.previewDemoProject();
+                            if (ribbonMode == QLatin1String("graph")) {
+                                window.previewGraphView();
+                                QApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
+                            }
+                            const bool panesOk = ribbonMode != QLatin1String("panes") || window.previewPaneLayout();
+                            const bool projectOk = panesOk && (ribbonMode != QLatin1String("simworkspace")
+                                || window.previewDemoProject());
                             if (showSources) {
                                 // Exercise the real chip/controller path after
                                 // popup warm-up, plugin loading and app styling.
@@ -12501,6 +12672,8 @@ int main(int argc, char* argv[]) {
                         window.applyLayoutPreset(rcx::Layout_Workspace);
                     if (showBoth)
                         window.previewBothSplit();
+                    if (QApplication::arguments().contains("graph"))
+                        window.previewGraphView();
                     if (showCode)
                         window.previewCodeView();
                     if (closeTest)

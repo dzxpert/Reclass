@@ -12,6 +12,7 @@
 #include "commontypes.h"
 #include "clipboard.h"
 #include "diffutil.h"
+#include "value_components.h"
 #include "timeline/frame_provider.h"
 #include "timeline/timeline_hub.h"
 #include "timeline/timeline_service.h"
@@ -2514,7 +2515,7 @@ void RcxController::selectNodeFromCode(uint64_t nodeId) {
     while (id != 0) {
         bool found = false;
         for (auto* editor : m_editors) {
-            if (editor && editor->selectNodeId(id)) { found = true; break; }
+            if (editor && editor->isVisible() && editor->selectNodeId(id)) { found = true; break; }
         }
         if (found) return;
         const int idx = m_doc ? m_doc->tree.indexOfId(id) : -1;
@@ -2682,7 +2683,16 @@ void RcxController::refresh() {
             if (lm.nodeIdx < 0 || lm.nodeIdx >= m_doc->tree.nodes.size()) continue;
             const Node& node = m_doc->tree.nodes[lm.nodeIdx];
 
-            if (isHexPreview(node.kind)) {
+            if (const int count = valueComponentCount(lm.nodeKind)) {
+                if (lm.unreadable || lm.notCaptured || isSyntheticLine(lm)) continue;
+                const uint64_t rowAddr = valueComponentRowAddress(lm);
+                for (int component = 0; component < count; ++component) {
+                    if (runsOverlap(changedRuns, rowAddr + uint64_t(component) * 4, 4)) {
+                        lm.changedComponentMask |= uint8_t(1u << component);
+                        lm.dataChanged = true;
+                    }
+                }
+            } else if (isHexPreview(node.kind)) {
                 // Per-byte tracking for hex preview nodes
                 for (int b = 0; b < lm.lineByteCount; b++) {
                     if (runsOverlap(changedRuns,lm.offsetAddr + (uint64_t)b, 1)) {
@@ -2729,6 +2739,11 @@ void RcxController::refresh() {
                 if (lm.lineKind != LineKind::Field && !extraRow) continue;
                 // Member rows (enum, bitfield, code) have no value of their own.
                 if (lm.isMemberLine) continue;
+
+                // Synthesized vector array elements also have component-level
+                // changes, although their owner node is an Array and has no
+                // scalar history of its own.
+                if (lm.changedComponentMask) lm.heatLevel = 1;
 
                 const Node& node = m_doc->tree.nodes[lm.nodeIdx];
                 // Skip containers — they don't have scalar values

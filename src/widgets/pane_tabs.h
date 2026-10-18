@@ -3,11 +3,13 @@
 #include "themes/theme.h"
 #include "themes/thememanager.h"
 #include "paintutil.h"
+#include "dock_header.h"
 
 #include <QPaintEvent>
 #include <QResizeEvent>
 #include <QShowEvent>
 #include <QPainter>
+#include <QLabel>
 #include <QSplitter>
 #include <QString>
 #include <QTabBar>
@@ -25,50 +27,86 @@ struct PaneTabSpec { const char* name; const char* tip; };
 inline constexpr PaneTabSpec kPaneTabs[] = {
     { "Structure", "Structure view" },
     { "Code",      "Generated code" },
+    { "Graph",     "Type relationships and references" },
     { "Debug",     "Layout diagnostics (compose dump)" },
-    { "Both",      "Structure and code side by side" },
 };
 inline constexpr int kPaneTabCount = int(sizeof(kPaneTabs) / sizeof(kPaneTabs[0]));
 
-// Single source of truth for the pane-tab strip — used BOTH at pane creation
-// and in MainWindow::applyTheme. The two sites used to carry hand-written
-// sheets that disagreed (paper vs background, bottom underline vs a 3-px top
-// accent with a negative padding), so a theme switch silently changed the
-// grammar of the strip.
-//
-// One tab grammar (shared with the ribbon tabs and the doc tabs): no box, no
-// fill, no radius — the selected tab is marked only by 2 px of accent on the
-// BOTTOM edge, inactive is textDim, hover and active are text.
+// Use the document-tab grammar: adjacent cells, single device-pixel dividers,
+// regular chrome text and a two-device-pixel underline on the current view.
+class PaneTabBar : public QTabBar {
+public:
+    explicit PaneTabBar(QWidget* parent = nullptr) : QTabBar(parent) {
+        setFont(chromeFont());
+        setExpanding(false);
+        setDrawBase(false);
+        setMouseTracking(true);
+    }
+protected:
+    QSize tabSizeHint(int index) const override {
+        return {fontMetrics().horizontalAdvance(tabText(index)) + 2 * kGutter,
+                kDockHeaderContentH};
+    }
+    QSize minimumTabSizeHint(int index) const override { return tabSizeHint(index); }
+    void mouseMoveEvent(QMouseEvent* e) override {
+        const int next = tabAt(e->pos());
+        if (next != hovered) { hovered = next; update(); }
+        QTabBar::mouseMoveEvent(e);
+    }
+    void leaveEvent(QEvent* e) override { hovered = -1; update(); QTabBar::leaveEvent(e); }
+    void paintEvent(QPaintEvent*) override {
+        const auto& t = ThemeManager::instance().current();
+        const QColor seam = containerBorderColor(t);
+        QPainter p(this);
+        p.fillRect(rect(), t.background);
+        fillTopDeviceRowOfRect(p, QRectF(rect()), seam);
+        for (int i = 0; i < count(); ++i) {
+            if (!isTabVisible(i)) continue;
+            const QRect r = tabRect(i);
+            const bool active = i == currentIndex();
+            p.fillRect(r, active ? editorPaperColor(t) : i == hovered ? t.hover : t.background);
+            // Leave the selected cell open to the content above it.
+            if (!active) fillTopDeviceRowOfRect(p, QRectF(r), seam);
+            fillRightDeviceColOfRect(p, QRectF(r), seam);
+            p.setPen(active || i == hovered ? t.text : t.textDim);
+            p.drawText(r.adjusted(kGutter, 0, -kGutter, 0), Qt::AlignVCenter | Qt::AlignLeft, tabText(i));
+            if (active) {
+                fillBottomDeviceRowsOfRect(p, QRectF(r), kUnderlineRows, t.indHoverSpan);
+                if (hasFocus()) {
+                    const QRectF focus = QRectF(r).adjusted(2, 2, -2, -2);
+                    fillLeftDeviceColOfRect(p, focus, t.borderFocused);
+                    fillRightDeviceColOfRect(p, focus, t.borderFocused);
+                }
+            }
+        }
+    }
+private:
+    int hovered = -1;
+};
+
+class PaneTabs : public QTabWidget {
+public:
+    explicit PaneTabs(QWidget* parent = nullptr) : QTabWidget(parent) {
+        setTabBar(new PaneTabBar(this));
+        setTabPosition(South);
+        setDocumentMode(true);
+    }
+protected:
+    void paintEvent(QPaintEvent* e) override {
+        QTabWidget::paintEvent(e);
+        // Continue the strip seam through the spare space to the corner controls.
+        QPainter p(this);
+        fillTopDeviceRowOfRect(p, QRectF(0, tabBar()->y(), width(), tabBar()->height()),
+                              containerBorderColor(ThemeManager::instance().current()));
+    }
+};
+
 inline QString paneTabStyle(const Theme& t, const QString& family) {
     return QStringLiteral(
-        // The whole strip is one surface. Styling only ::tab left the tabs on
-        // paper and the rest of the bar on theme.background, which drew a
-        // faint box around the tab group — the exact "fill at rest" cue the
-        // underline grammar exists to remove.
         "QTabWidget { background: %1; }"
-        // The zoom/format corner widget is part of the SAME strip, so it
-        // shares the surface. Without this the strip read two-tone: paper
-        // under the tabs, theme.background under the zoom control.
-        "QWidget#rcxPaneCorner { background: %1; }"
-        "QTabWidget::pane { border: none; background: %1; }"
-        "QTabBar { border: none; background: %1; }"
-        "QTabBar::tab {"
-        "  background: %1; color: %2; padding: 0px %6px; border: none;"
-        // Reserve the underline on EVERY tab. A border-bottom only on
-        // :selected adds to that tab's box, so the selected tab stood 2 px
-        // taller than its siblings (and than the corner widget, pinned to 26).
-        "  border-bottom: 2px solid transparent;"
-        "  border-radius: 0px; height: 26px;"
-        "  font-family: '%5'; font-size: 10pt;"
-        "}"
-        // kGutter is spent ONCE: the margin puts the first tab's box at the
-        // gutter, so its padding-left has to go, or the first ink lands at 16.
-        "QTabBar::tab:first { margin-left: %6px; padding-left: 0px; }"
-        "QTabBar::tab:selected { color: %3; border-bottom: 2px solid %4; }"
-        "QTabBar::tab:hover { color: %3; }")
-        .arg(editorPaperColor(t).name(), t.textDim.name(), t.text.name(),
-             t.indHoverSpan.name(), family)
-        .arg(kGutter);   // the strip's first ink lines up with every other strip
+        "QTabWidget::pane { border: none; background: %2; }"
+        "QTabBar { border: none; background: %1; font-family: '%3'; font-size: 10pt; }")
+        .arg(t.background.name(), editorPaperColor(t).name(), family);
 }
 
 // ── The pane's outline ──
@@ -87,9 +125,7 @@ inline QString paneTabStyle(const Theme& t, const QString& family) {
 // the QTabWidget itself does not work, because its page and tab bar are
 // children that cover the parent completely.
 //
-// EditorContainer keeps only its BOTTOM edge, which is the seam between the
-// document and the tab strip. Any other edge it drew would land on this box's
-// device rows and double.
+// PaneTabs owns the content/strip seam; content containers have no inset border.
 //
 // No Q_OBJECT: this declares no signals or slots, and both the functor+context
 // connect and findChildren work without moc (the rule BreadcrumbBar and
@@ -107,22 +143,50 @@ public:
                 [this](const Theme& t) { applyBoxTheme(t); });
     }
 
+    void previewPlacement(int direction) {
+        m_previewDirection = direction;
+        if (!m_preview) {
+            m_preview = new QLabel(this);
+            m_preview->setAttribute(Qt::WA_TransparentForMouseEvents);
+            m_preview->setAlignment(Qt::AlignCenter);
+            m_preview->setFont(font());
+        }
+        if (!direction) { m_preview->hide(); return; }
+        const auto& t = ThemeManager::instance().current();
+        const QColor c = t.borderFocused;
+        m_preview->setStyleSheet(QString("background: rgba(%1,%2,%3,35); color: %4; border: 1px solid %5;")
+            .arg(c.red()).arg(c.green()).arg(c.blue()).arg(t.text.name(), c.name()));
+        m_preview->setText(direction == Qt::Horizontal ? "New view to the right" : "New view below");
+        positionPreview(); m_preview->show(); m_preview->raise();
+    }
     QColor boxColor() const { return m_box; }
+    void setPaneActive(bool active) { m_active = active; update(); }
 
 protected:
+    void resizeEvent(QResizeEvent* e) override { QWidget::resizeEvent(e); positionPreview(); }
     void paintEvent(QPaintEvent*) override {
         if (!m_box.isValid()) return;
         QPainter p(this);
         const QRectF r(rect());
-        rcx::fillTopDeviceRowOfRect(p, r, m_box);
+        rcx::fillTopDeviceRowOfRect(p, r, m_active ? m_focus : m_box);
         rcx::fillBottomDeviceRowOfRect(p, r, m_box);
         rcx::fillLeftDeviceColOfRect(p, r, m_box);
         rcx::fillRightDeviceColOfRect(p, r, m_box);
     }
 
 private:
+    QLabel* m_preview = nullptr;
+    int m_previewDirection = 0;
+    void positionPreview() {
+        if (!m_preview || !m_previewDirection) return;
+        QRect r = rect().adjusted(2, 2, -2, -34);
+        if (m_previewDirection == Qt::Horizontal) r.setLeft(r.center().x());
+        else r.setTop(r.center().y());
+        m_preview->setGeometry(r);
+    }
     void applyBoxTheme(const Theme& t) {
         m_box = containerBorderColor(t);
+        m_focus = t.borderFocused;
         // Both mode puts the two views in a splitter inside this box, so its
         // handle is an interior seam and has to match. Done here so no
         // theme-apply site has to know the pane owns a splitter.
@@ -134,8 +198,10 @@ private:
         update();
     }
 
+    bool m_active = false;
     QWidget* m_inner = nullptr;
     QColor   m_box;
+    QColor   m_focus;
 };
 
 } // namespace rcx

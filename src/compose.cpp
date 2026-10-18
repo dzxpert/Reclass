@@ -1449,8 +1449,14 @@ void composeNode(ComposeState& state, const NodeTree& tree,
                 lm.offsetText.clear();
                 lm.foldLevel = computeFoldLevel(depth, false);
                 lm.markerMask = 0;
-                QString footerText = fmt::indent(depth)
-                    + QStringLiteral("}  +1 +10h +100h +1000h Trim Top");
+                // Every recursive pointer level used to repeat four growth
+                // pills and a size comment, turning linked structures into a
+                // wall of identical footer actions. Keep the full controls on
+                // the top-level pointer; nested pointer closures stay quiet.
+                const bool showTrimActions = (depth == 0);
+                QString footerText = fmt::indent(depth) + QChar('}');
+                if (showTrimActions)
+                    footerText += QStringLiteral("  +1 +10h +100h +1000h Trim Top");
                 int refSz = 0;
                 if (hasMaterialized) {
                     // Local edits can grow or trim the pointee independently
@@ -1466,7 +1472,7 @@ void composeNode(ComposeState& state, const NodeTree& tree,
                 } else {
                     refSz = tree.structSpan(node.refId, &state.childMap);
                 }
-                if (refSz > 0)
+                if (showTrimActions && refSz > 0)
                     footerText += QStringLiteral("  // 0x%1 (%2)")
                         .arg(QString::number(refSz, 16).toUpper()).arg(refSz);
                 state.emitLine(footerText, std::move(lm));

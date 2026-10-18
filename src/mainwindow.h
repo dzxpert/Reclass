@@ -11,7 +11,7 @@
 #include "widgets/panel_search_field.h"
 #include "names/name_provider.h"
 namespace rcx { class SymbolDownloader; class DockOverlay; class DockDragDetector; class RcxTooltip; class UnifiedSymbolPanel; class TimelineStrip; }
-namespace rcx { class RibbonBar; class RibbonActions; class ZoomSlider; }
+namespace rcx { class RibbonBar; class RibbonActions; }
 class QToolBar;
 class QActionGroup;
 #include <QMainWindow>
@@ -43,6 +43,8 @@ class ShimmerLabel;
 class SourceStatusChip;
 class DockGripWidget;
 class WorkspaceDelegate;
+class TypeGraphView;
+class PaneViewStrip;
 
 class MainWindow : public QMainWindow {
     Q_OBJECT
@@ -99,6 +101,8 @@ public:
     // active tab's first pane. Used by `--screenshot <png> both` to capture
     // the split layout headlessly (mirrors the scanner/workspace args).
     void previewBothSplit();
+    void previewGraphView();
+    bool previewPaneLayout();
     bool previewZoomInteraction(); // --screenshot zoom: click coverage and view sync
     bool previewDemoProject(); // --screenshot simworkspace: close/reopen demo types
     void previewCodeView();   // select the single "Code" view (test/preview)
@@ -194,7 +198,7 @@ public:
                                           uint64_t targetStructId) const;
 
 private:
-    enum ViewMode { VM_Reclass, VM_Rendered, VM_Debug, VM_Both };
+    enum ViewMode { VM_Reclass, VM_Rendered, VM_Graph, VM_Debug };
 
     QWidget*        m_centralPlaceholder;
     ShimmerLabel*   m_statusLabel;
@@ -203,6 +207,11 @@ private:
     QLabel*         m_progressLabel = nullptr;
     QString         m_appStatus;
     QString         m_appStatusDim;
+    QString         m_statusNotification;
+    QTimer*         m_statusNotificationTimer = nullptr;
+    QString         m_mcpStatus;
+    void showStatusNotification(const QString& text, int durationMs = 5000);
+    void refreshStatusDisplay();
     bool            m_mcpBusy   = false;
     QTimer*         m_mcpClearTimer = nullptr;
     TitleBarWidget* m_titleBar = nullptr;
@@ -277,6 +286,7 @@ private:
 
     struct SplitPane {
         QTabWidget*    tabWidget = nullptr;
+        PaneViewStrip* viewStrip = nullptr;
         QWidget*     paneBox     = nullptr;   // rcx::PaneBox: draws the pane's outline
         RcxEditor*     editor    = nullptr;
         QsciScintilla* rendered  = nullptr;
@@ -287,9 +297,9 @@ private:
         QComboBox*     fmtCombo   = nullptr;
         QComboBox*     scopeCombo = nullptr;
         QToolButton*   fmtGear    = nullptr;
-        ZoomSlider*    zoomSlider = nullptr;  // drives Scintilla zoom; always shown
-        QLabel*        zoomLabel  = nullptr;  // "%" readout next to the slider
+        int            zoomLevel = 0;
         ViewMode       viewMode  = VM_Reclass;
+        TypeGraphView* graphView = nullptr;
         uint64_t       lastRenderedRootId = 0;
         // Cached output of the last renderCode* call — keyed on
         // (tree.generation, rootId, format, scope, asserts). Skip
@@ -305,12 +315,6 @@ private:
         // hidden; visibility toggled via the View menu "Minimap" action.
         QsciScintilla* minimap         = nullptr;
         QWidget*       editorContainer = nullptr;
-        // "Both" view: a single tab whose content is a splitter holding the
-        // editor (Reclass, 67%) and the rendered Code view (33%) side by side.
-        // editorContainer/renderedContainer are REPARENTED between their own
-        // tab pages and bothSplitter as the user switches tabs — so the one
-        // tab bar + corner (zoom, format/scope/gear) control both at once.
-        QSplitter*     bothSplitter = nullptr;
         QWidget*       reclassPage  = nullptr;  // tab-0 host for editorContainer
         QWidget*       codePage     = nullptr;  // tab-1 host for renderedContainer
     };
@@ -321,6 +325,7 @@ private:
         QSplitter*         splitter;
         QVector<SplitPane> panes;
         int                activePaneIdx = 0;
+        QPointer<QTabWidget> maximizedPane;
         // The class timeline along the bottom of the tab. Per TAB, not per
         // pane: capture belongs to the controller, which every pane shares.
         TimelineStrip*     timeline = nullptr;
@@ -442,6 +447,12 @@ private:
     void styleDebugText(QsciScintilla* sci, const QString& text);
 
     SplitPane createSplitPane(TabState& tab);
+    void splitPane(QTabWidget* source, Qt::Orientation direction, int mode = -1);
+    void closePane(QTabWidget* source);
+    void pairPane(QTabWidget* source);
+    void restoreViews();
+    void activatePane(QTabWidget* source);
+    void updatePaneAffordances(TabState& tab);
     void applyTheme(const Theme& theme);
     SplitPane* findPaneByTabWidget(QTabWidget* tw);
     SplitPane* findActiveSplitPane();

@@ -186,7 +186,7 @@ class AddressBar : public QWidget {
 public:
     // The bar is a field: the same height as the house text field beside it
     // (the panel filter boxes), so the two read as one control family.
-    static constexpr int kAddressBarHeight = 26;
+    static constexpr int kAddressBarHeight = kEditorBarHeight;
     static_assert(kAddressBarHeight == PanelSearchField::kFieldHeight,
                   "the address bar must match PanelSearchField's height");
 

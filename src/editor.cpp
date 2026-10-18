@@ -1,4 +1,5 @@
 #include "editor.h"
+#include "value_components.h"
 #include <QToolButton>
 #include "disasm.h"
 #include "providerregistry.h"
@@ -1719,6 +1720,7 @@ static constexpr int IND_HOVER_SPAN = 11;  // Blue text on hover (link-like)
 // Slot 12 is free: it held the footer-pill outline until the boxes were
 // removed (2026-09-06). Slot 30 (the pill hover box) went with it.
 static constexpr int IND_HEAT_COLD    = 13; // Heatmap level 1 (changed once)
+static constexpr int IND_VALUE_SYNTAX = 25; // Muted vector/matrix punctuation and row labels
 static constexpr int IND_CLASS_NAME   = 14; // Teal text for root class name
 static constexpr int IND_HINT_GREEN   = 15; // Green text for hint/comment text
 static constexpr int IND_LOCAL_OFF    = 16; // Dim text for inline local offset in relative mode
@@ -1743,10 +1745,6 @@ static constexpr int IND_CHIP_PRESSED = 24; // Stronger pill overlay while the m
                                             // (it used to be darker, which made a press read as
                                             // the chip going dead), so pressed reads as a
                                             // firmer version of hover, not an inversion.
-                                            // Slot 25 is retired: it tinted the old box-drawing
-                                            // tree glyphs. Tree lines are drawn now
-                                            // (paintTreeGuides); tests mirror slot numbers, so
-                                            // the others keep theirs.
 static constexpr int IND_EDIT_BOUNDS  = 27; // STRAIGHTBOX background fill on the byte ranges
                                             // covered by an active byte-range inline edit. Tints
                                             // the editable digits with a faded indHoverSpan so the
@@ -2294,6 +2292,8 @@ void RcxEditor::setupScintilla() {
 
     // Hover span indicator — link-like text
     m_sci->SendScintilla(QsciScintillaBase::SCI_INDICSETSTYLE,
+                         IND_VALUE_SYNTAX, 17 /*INDIC_TEXTFORE*/);
+    m_sci->SendScintilla(QsciScintillaBase::SCI_INDICSETSTYLE,
                          IND_HOVER_SPAN, 17 /*INDIC_TEXTFORE*/);
 
     // Tail-chip pill background — STRAIGHTBOX styled to match the footer
@@ -2561,6 +2561,8 @@ void RcxEditor::applyTheme(const Theme& theme) {
     m_sci->SendScintilla(QsciScintillaBase::SCI_INDICSETFORE,
                          IND_HOVER_SPAN, theme.indHoverSpan);
     // Heatmap colors
+    m_sci->SendScintilla(QsciScintillaBase::SCI_INDICSETFORE,
+                         IND_VALUE_SYNTAX, theme.textMuted);
     m_sci->SendScintilla(QsciScintillaBase::SCI_INDICSETFORE,
                          IND_HEAT_COLD, theme.indHeatCold);
     m_sci->SendScintilla(QsciScintillaBase::SCI_INDICSETFORE,
@@ -3055,6 +3057,7 @@ void RcxEditor::applyDocument(const ComposeResult& result) {
                 && a.isArrayElement == b.isArrayElement
                 && a.isMemberLine == b.isMemberLine
                 && a.heatLevel == b.heatLevel
+                && a.changedComponentMask == b.changedComponentMask
                 && a.chips.size() == b.chips.size()
                 && std::equal(a.chips.cbegin(), a.chips.cend(), b.chips.cbegin(),
                               [](const LineChip& x, const LineChip& y) {
@@ -3103,7 +3106,7 @@ void RcxEditor::applyDocument(const ComposeResult& result) {
                         IND_TYPE_HINT, IND_RTTI_HINT, IND_CHIP_BG,
                         IND_CHIP_HOVER, IND_CHIP_PRESSED,
                         IND_BYTE_SEL, IND_EDIT_BOUNDS,
-                        IND_UNREADABLE, IND_NOT_CAPTURED}) {
+                        IND_UNREADABLE, IND_NOT_CAPTURED, IND_VALUE_SYNTAX}) {
             m_sci->SendScintilla(QsciScintillaBase::SCI_SETINDICATORCURRENT, (long)ind);
             m_sci->SendScintilla(QsciScintillaBase::SCI_INDICATORCLEARRANGE, (long)0, docLen);
         }
@@ -4909,17 +4912,38 @@ void RcxEditor::applyHeatmapHighlight(const QVector<LineMeta>& meta,
         // the "rebuild from scratch" mental model.
         for (int hi : heatIndicators)
             clearIndicatorLine(hi, i);
+        clearIndicatorLine(IND_VALUE_SYNTAX, i);
+
+        const QString& lineText = lineTexts[i];
+        ColumnSpan vs = narrowPtrValueSpan(lm,
+            valueSpan(lm, lineText.size(), typeW, nameW), lineText);
+        if (!vs.valid) continue;
+
+        if (valueComponentCount(lm.nodeKind)) {
+            const auto components = valueComponentSpans(lineText, vs, lm.nodeKind);
+            if (components.isEmpty()) continue;
+            int previousEnd = vs.start;
+            for (int component = 0; component < components.size(); ++component) {
+                const auto& span = components[component];
+                fillIndicatorCols(IND_VALUE_SYNTAX, i, previousEnd, span.start);
+                if (heat > 0 && !lm.unreadable && !lm.notCaptured
+                    && (lm.changedComponentMask & (1u << component))) {
+                    fillIndicatorCols(heatIndicators[qBound(0, heat - 1, 2)],
+                                      i, span.start, span.end);
+                }
+                previousEnd = span.end;
+            }
+            // Stop at the closing bracket: comments and chips keep their own styles.
+            const int close = lineText.indexOf(']', previousEnd);
+            if (close >= previousEnd && close < vs.end)
+                fillIndicatorCols(IND_VALUE_SYNTAX, i, previousEnd, close + 1);
+            continue;
+        }
 
         if (heat <= 0) continue;
 
         // Pick the right indicator for this heat level (1→cold, 2→warm, 3→hot)
         int activeInd = heatIndicators[qBound(0, heat - 1, 2)];
-
-        // Apply heat-level indicator to value span (narrowed for pointer-like nodes)
-        const QString& lineText = lineTexts[i];
-        ColumnSpan vs = narrowPtrValueSpan(lm,
-            valueSpan(lm, lineText.size(), typeW, nameW), lineText);
-        if (!vs.valid) continue;
 
         // Hex preview rows: paint only the byte spans that actually
         // changed this tick, not the whole 8/16-byte run. The old

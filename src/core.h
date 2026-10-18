@@ -1180,6 +1180,7 @@ struct LineMeta {
                                       // failed) and never as a plausible-looking zero.
     int      heatLevel      = 0;     // 0=static, 1=cold, 2=warm, 3=hot (from ValueHistory)
     QVector<int> changedByteIndices;  // Hex preview: which byte indices (0-based) changed on this line
+    uint8_t changedComponentMask = 0; // Vector/matrix row: one bit per changed float
     int      lineByteCount  = 0;     // Hex preview: actual data byte count on this line
     int      effectiveTypeW = 14;  // Per-line type column width used for rendering
     int      effectiveNameW = 22;  // Per-line name column width used for rendering

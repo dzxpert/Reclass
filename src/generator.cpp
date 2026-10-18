@@ -1420,10 +1420,10 @@ const char* codeScopeName(CodeScope scope) {
     // Plain language, and the SAME strings the ribbon's Code ▾ menu offers —
     // the combo and the menu drive one setting, so they must not name it two
     // different ways ("Full SDK" vs "All Classes" was exactly that).
-    case CodeScope::Current:       return "This Class Only";
-    case CodeScope::WithChildren:  return "This Class";
-    case CodeScope::FullSdk:       return "All Classes";
-    default:                       return "This Class Only";
+    case CodeScope::Current:       return "Current type";
+    case CodeScope::WithChildren:  return "Type + references";
+    case CodeScope::FullSdk:       return "All types";
+    default:                       return "Current type";
     }
 }
 

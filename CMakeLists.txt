@@ -483,6 +483,23 @@ if(BUILD_TESTING)
         PRIVATE ${QT}::Core ${QT}::Widgets ${QT}::Test)
     add_test(NAME test_dock_resize COMMAND test_dock_resize)
 
+    add_executable(test_pane_layout tests/test_pane_layout.cpp
+        src/themes/theme.cpp src/themes/thememanager.cpp)
+    target_include_directories(test_pane_layout PRIVATE src)
+    target_link_libraries(test_pane_layout PRIVATE ${QT}::Widgets ${QT}::Svg ${QT}::Test)
+    add_test(NAME test_pane_layout COMMAND test_pane_layout)
+
+    add_executable(test_type_graph_view tests/test_type_graph_view.cpp
+        src/themes/theme.cpp src/themes/thememanager.cpp)
+    target_include_directories(test_type_graph_view PRIVATE src)
+    target_link_libraries(test_type_graph_view PRIVATE ${QT}::Core ${QT}::Widgets ${QT}::Svg ${QT}::Test)
+    add_test(NAME test_type_graph_view COMMAND test_type_graph_view)
+
+    add_executable(test_type_graph tests/test_type_graph.cpp)
+    target_include_directories(test_type_graph PRIVATE src)
+    target_link_libraries(test_type_graph PRIVATE ${QT}::Core ${QT}::Test)
+    add_test(NAME test_type_graph COMMAND test_type_graph)
+
     add_executable(test_format tests/test_format.cpp src/format.cpp src/addressparser.cpp)
     target_include_directories(test_format PRIVATE src)
     target_link_libraries(test_format PRIVATE ${QT}::Core ${QT}::Test)
@@ -1441,7 +1458,7 @@ if(BUILD_TESTING)
         # MainWindow itself is not linkable from a test target.
         add_executable(test_pane_chrome tests/test_pane_chrome.cpp src/themes/theme.cpp)
         target_include_directories(test_pane_chrome PRIVATE src)
-        target_link_libraries(test_pane_chrome PRIVATE ${QT}::Widgets ${QT}::Test)
+        target_link_libraries(test_pane_chrome PRIVATE ${QT}::Widgets ${QT}::Test ${QT}::Svg)
         add_test(NAME test_pane_chrome COMMAND test_pane_chrome)
 
         # Deploy Qt runtime DLLs for tests (run windeployqt on a representative test exe

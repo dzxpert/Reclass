@@ -32,6 +32,7 @@
 #include "editor.h"
 #include "core.h"
 #include "tree_fixture.h"
+#include "value_components.h"
 
 using namespace rcx;
 
@@ -522,6 +523,62 @@ private slots:
     void testAutoDoesNotConsumeAddressBarWidth() {
         QVERIFY(!m_editor->findChild<QToolButton*>("autoResolveButton"));
         QVERIFY(!m_editor->findChild<QLabel*>("autoResolutionStatus"));
+    }
+
+    void testComponentHeatKeepsSyntaxMuted_data() {
+        QTest::addColumn<int>("kind");
+        QTest::newRow("vec2") << int(NodeKind::Vec2);
+        QTest::newRow("vec3") << int(NodeKind::Vec3);
+        QTest::newRow("vec4") << int(NodeKind::Vec4);
+        QTest::newRow("matrix") << int(NodeKind::Mat4x4);
+    }
+
+    void testComponentHeatKeepsSyntaxMuted() {
+        QFETCH(int, kind);
+        NodeTree tree;
+        tree.baseAddress = 0;
+        const auto root = treefix::add(tree, NodeKind::Struct, "Test", 0, 0);
+        treefix::add(tree, NodeKind(kind), "value", root, 0);
+        QByteArray bytes(64, '\0');
+        const float values[] = {-1.5f, 12345.0f, 0.0f, 0.35f};
+        for (int i = 0; i < 16; ++i)
+            memcpy(bytes.data() + i * 4, &values[i % 4], 4);
+        BufferProvider provider(bytes);
+        auto result = compose(tree, provider, root);
+        for (auto& lm : result.meta) {
+            if (lm.nodeKind != NodeKind(kind)) continue;
+            QVERIFY(!lm.unreadable);
+            lm.heatLevel = 3;
+            lm.changedComponentMask = 2; // Only the second float changed.
+        }
+        m_editor->applyDocument(result);
+        const auto lines = result.text.split('\n');
+        int checked = 0;
+        for (int i = 0; i < result.meta.size(); ++i) {
+            const auto& lm = result.meta[i];
+            if (lm.nodeKind != NodeKind(kind)) continue;
+            const auto value = RcxEditor::valueSpan(lm, lines[i].size(),
+                                                   lm.effectiveTypeW, lm.effectiveNameW);
+            const auto spans = valueComponentSpans(lines[i], value, lm.nodeKind);
+            QCOMPARE(spans.size(), valueComponentCount(lm.nodeKind));
+            ++checked;
+            const int close = lines[i].indexOf(']', spans.last().end);
+            for (int col = value.start; col <= close; ++col) {
+                int component = -1;
+                for (int j = 0; j < spans.size(); ++j)
+                    if (col >= spans[j].start && col < spans[j].end) component = j;
+                QCOMPARE(indAt(m_editor->scintilla(), 18, i, col), component == 1);
+                QCOMPARE(indAt(m_editor->scintilla(), 25, i, col), component < 0);
+            }
+        }
+        QCOMPARE(checked, NodeKind(kind) == NodeKind::Mat4x4 ? 4 : 1);
+
+        // A later stable refresh retains history but must clear component heat.
+        for (auto& lm : result.meta) lm.changedComponentMask = 0;
+        m_editor->applyDocument(result);
+        for (int i = 0; i < lines.size(); ++i)
+            for (int col = 0; col < lines[i].size(); ++col)
+                QVERIFY(!indAt(m_editor->scintilla(), 18, i, col));
     }
 
     // ── Test: CommandRow at line 0 rejects non-ADDR edits ──

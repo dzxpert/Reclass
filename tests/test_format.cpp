@@ -1,6 +1,7 @@
 #include <QtTest/QTest>
 #include <cstring>
 #include "core.h"
+#include "value_components.h"
 
 using namespace rcx;
 
@@ -9,6 +10,23 @@ class TestFormat : public QObject {
 private slots:
     // The float decimals setting is global: every test starts from the default.
     void init() { fmt::setFloatDecimals(fmt::kDefaultFloatDecimals); }
+
+    void componentRowsAndSpecialValues() {
+        LineMeta lm;
+        lm.offsetAddr = 0x1000;
+        lm.nodeKind = NodeKind::Mat4x4;
+        for (int row = 0; row < 4; ++row) {
+            lm.subLine = row;
+            QCOMPARE(valueComponentRowAddress(lm), uint64_t(0x1000 + row * 16));
+        }
+        const QString text = "row3 [ -0.000f, NaN, inf, -inf]  // comment";
+        const auto spans = valueComponentSpans(text, {0, int(text.size()), true}, NodeKind::Mat4x4);
+        QCOMPARE(spans.size(), 4);
+        const QStringList expected{"-0.000f", "NaN", "inf", "-inf"};
+        for (int i = 0; i < spans.size(); ++i)
+            QCOMPARE(text.mid(spans[i].start, spans[i].end - spans[i].start), expected[i]);
+        QVERIFY(valueComponentSpans("row0 ??", {0, 7, true}, NodeKind::Mat4x4).isEmpty());
+    }
 
     void testTypeName() {
         QString s = fmt::typeName(NodeKind::Float);
