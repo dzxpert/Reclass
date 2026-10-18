@@ -1453,7 +1453,7 @@ void composeNode(ComposeState& state, const NodeTree& tree,
                 // pills and a size comment, turning linked structures into a
                 // wall of identical footer actions. Keep the full controls on
                 // the top-level pointer; nested pointer closures stay quiet.
-                const bool showTrimActions = (depth == 0);
+                const bool showTrimActions = (depth <= 1);
                 QString footerText = fmt::indent(depth) + QChar('}');
                 if (showTrimActions)
                     footerText += QStringLiteral("  +1 +10h +100h +1000h Trim Top");
